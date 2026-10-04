@@ -172,12 +172,15 @@
             </div>
             <p class="mcp-note">可以跟 agent 说「先把这个视频转成带时间轴的文字稿」——它走 <code>transcribe_video</code> + <code>get_transcript</code>，<strong>本机不需要配 API Key</strong>，整理成什么样由客户端的模型决定；要一份现成成品笔记才用 <code>summarize_video</code>（需要 Key）。</p>
             <p class="mcp-note">只支持 stdio 的客户端可以跑 <code>python -m backend.mcp_server</code>，它会自动找 8000–8019 上已经开着的本服务。</p>
-            <p class="mcp-note">服务只监听 <code>127.0.0.1</code>，局域网连不进来；Key 和 B 站凭据只留在本机（Windows 用系统 DPAPI 加密）。</p>
+            <p class="mcp-note">服务只监听 <code>127.0.0.1</code>，局域网连不进来；Key 和 B 站凭据只留在本机（Windows 用系统 DPAPI、macOS 用钥匙串加密）。</p>
             <p id="mcpUnavailable" class="mcp-note" hidden>这台机器没装 <code>mcp</code> 依赖，上面的地址暂时连不通（网页端和任务本身不受影响）。装齐 <code>backend/requirements.txt</code> 里的依赖后重启即可。</p>
         </details>
 
         <div class="sidebar-actions">
-            <button id="resetConfigBtn" class="button ghost" type="button">恢复默认</button>
+            <div class="sidebar-action-row">
+                <button id="resetConfigBtn" class="button ghost" type="button">恢复默认</button>
+                <button id="openWorkspaceBtn" class="button ghost" type="button">打开转写目录</button>
+            </div>
             <p>模型选择、识别参数和主题改动即自动记住（仅本机浏览器）；API Key 不写入浏览器，只保留在当前页面内存中。</p>
         </div>
     </aside>
@@ -275,6 +278,51 @@
                 </div>
                 <div id="biliPagesList" class="bili-pages-list" role="group" aria-label="勾选要转写的分 P"></div>
             </div>
+            <details id="upListSection" class="bili-pages-panel up-list-section collapsible-section">
+                <summary>按 UID 拉投稿列表</summary>
+                <div class="up-list-controls">
+                    <label class="field up-uid-field">
+                        <span class="sr-only">UP 主 UID</span>
+                        <input type="text" id="upUid" inputmode="numeric" autocomplete="off"
+                               placeholder="UP 主 UID（space.bilibili.com/123456 里的数字）">
+                    </label>
+                    <label class="field">
+                        <span class="sr-only">范围</span>
+                        <select id="upMode">
+                            <option value="all" selected>全部视频</option>
+                            <option value="recent">最近 N 个</option>
+                        </select>
+                    </label>
+                    <label class="field" id="upLimitField" hidden>
+                        <span class="sr-only">最近几个</span>
+                        <input type="number" id="upLimit" value="20" min="1" max="1000">
+                    </label>
+                    <button id="upFetchBtn" class="button secondary compact-button" type="button">拉取全部</button>
+                    <button id="upMoreBtn" class="button ghost compact-button" type="button" hidden>继续拉取</button>
+                    <button id="upCopyBtn" class="button ghost compact-button" type="button" hidden>复制选中链接</button>
+                    <button id="upTranscribeBtn" class="button primary compact-button" type="button" hidden>逐个转写选中</button>
+                </div>
+                <div class="up-list-controls">
+                    <label class="field up-uid-field">
+                        <span class="sr-only">空间链接</span>
+                        <input type="text" id="upSpaceUrl" autocomplete="off"
+                               placeholder="或粘贴空间链接（浏览器抓取）：space.bilibili.com/123456/upload/video">
+                    </label>
+                    <button id="upCrawlBtn" class="button secondary compact-button" type="button">浏览器抓取</button>
+                </div>
+                <div class="bili-pages-head">
+                    <div class="bili-pages-titles">
+                        <strong id="upSummary">输入 UID 后读取</strong>
+                        <small id="upHint">两个选项都走同一套增量存储：首次拉全后，之后每次只补新增，所以不会反复撞 B 站限流</small>
+                    </div>
+                    <div class="bili-pages-actions">
+                        <button id="upAllBtn" class="button ghost compact-button" type="button" hidden>全选</button>
+                        <button id="upNoneBtn" class="button ghost compact-button" type="button" hidden>全不选</button>
+                    </div>
+                </div>
+                <div id="upStatus" class="bili-login-status" role="status" aria-live="polite"></div>
+                <div id="upList" class="bili-pages-list" role="group" aria-label="UP 主投稿列表"></div>
+            </details>
             <p id="outputModeHint" class="output-mode-hint" hidden></p>
             <div id="biliHint" class="hint-bar" hidden>
                 <div class="hint-text">
@@ -369,6 +417,7 @@
                     <h3 id="resultTitle">视频笔记</h3>
                 </div>
                 <div class="result-actions">
+                    <button id="openTaskFolderBtn" class="button ghost" type="button" disabled>打开所在文件夹</button>
                     <button id="regenerateBtn" class="button ghost" type="button" disabled>基于转录重新生成</button>
                     <button id="copyNoteBtn" class="button ghost" type="button" disabled>复制笔记</button>
                     <label class="sr-only" for="formatSelect">下载格式</label>
@@ -401,6 +450,6 @@
 </div>
 
 <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-<script src="script.js?v=20260924-1"></script>
+<script src="script.js?v=20261003-6"></script>
 </body>
 </html>

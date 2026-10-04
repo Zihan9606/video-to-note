@@ -44,7 +44,7 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 from pydantic import BaseModel, Field, SecretStr
 
-from . import paraformer_asr, secret_box
+from . import bili_space, paraformer_asr, secret_box, space_page
 from .config_store import BiliCredentialsUnavailable, LLM_KEYS_FILE, ConfigStore
 from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
@@ -422,6 +422,20 @@ class BiliPagesRequest(BaseModel):
     """`POST /api/bili-pages` 的请求体：提交前预览 B 站分 P 清单。"""
 
     video_url: str
+    bilibili_cookie: BilibiliCookie | None = None
+
+
+class BiliSpaceRequest(BaseModel):
+    """`POST /api/bili-space-videos` 的请求体：按 UID 拉 UP 主投稿地址。"""
+
+    uid: int
+    # 只有两个选项，且都走同一套增量存储：all=全部，recent=最近 limit 条
+    mode: Literal["all", "recent"] = "all"
+    # mode=recent 时要最近几条（B 站按投稿时间倒序，前 N 条即最近 N 条）
+    limit: int | None = None
+    # 断点续传：上一批返回的 next_page 原样带回
+    start_page: int = 1
+    max_pages: int | None = None
     bilibili_cookie: BilibiliCookie | None = None
 
 
@@ -1042,7 +1056,7 @@ def _missing_key_message(model_type: str, base_url: str | None, resolved: dict[s
     reason = str(resolved.get("reason") or "")
     detail = {
         "undecryptable": (
-            f"为 {target} 保存的 Key 无法解密（可能来自其他机器或其他 Windows 账户），"
+            f"为 {target} 保存的 Key 无法解密（可能来自其他机器或另一个系统账户），"
             "请重新填写并保存"
         ),
         "corrupt_keys_file": (
@@ -1213,6 +1227,33 @@ async def clear_bili_credentials() -> dict[str, bool]:
     return {"saved": False}
 
 
+class OpenDirectoryRequest(BaseModel):
+    """`POST /api/open-directory`：不带 task_id 打开工作目录，带了就打开该任务的产物目录。"""
+
+    task_id: str | None = None
+
+
+@app.post("/api/open-directory")
+async def open_directory(payload: OpenDirectoryRequest) -> dict[str, Any]:
+    """用系统文件管理器打开转写文件的存放位置。
+
+    转写产物分散在 `workspace/<task_id>/` 下，用户最常问的就是"文件在哪"。
+    只接受本机任务 ID 或留空（工作目录根），**不接受任意路径**——否则这个端点
+    就是一个按需打开任意目录的入口。
+    """
+    workspace = WORKSPACE_DIR.resolve()
+    if payload.task_id:
+        target = (WORKSPACE_DIR / payload.task_id).resolve()
+        # resolve() 之后再比父目录：`../` 之类的输入会先被解析掉，挡不住就等于放行
+        if target.parent != workspace or not target.is_dir():
+            raise HTTPException(status_code=404, detail="任务目录不存在")
+    else:
+        target = workspace
+
+    opened = await asyncio.to_thread(_open_in_file_manager, target)
+    return {"opened": opened, "path": str(target)}
+
+
 def previous_bili_pages(normalized_url: str) -> list[int] | None:
     """该视频最近一次任务显式勾选的分 P（新任务在前扫描，没有则 None）。
 
@@ -1282,6 +1323,86 @@ async def preview_bilibili_pages(request: BiliPagesRequest) -> dict[str, Any]:
         # 该视频上次任务显式勾选的分 P；前端拿它做默认勾选（优先于 ?p=N）
         "previous_pages": previous_bili_pages(normalize_source_url(url)),
     }
+
+
+@app.post("/api/bili-space-videos")
+async def list_up_videos(request: BiliSpaceRequest) -> dict[str, Any]:
+    """按 UID 拉 UP 主投稿地址，供后续逐个转写。
+
+    只读投稿列表，不触发下载。B 站的风控是 IP 级的（连续请求会吃 412/-352/-403
+    并需要冷却），所以这个端点**永远返回已拿到的部分**，用 `complete` / `next_page`
+    告诉调用方还能不能继续，绝不因为半路被拦就把整批数据丢掉。
+    凭据可选，但带上能明显提高成功率（与 `/api/bili-pages` 同一条经验）。
+    """
+    if request.uid <= 0:
+        raise HTTPException(status_code=400, detail="UID 必须是正整数")
+    if request.start_page < 1:
+        raise HTTPException(status_code=400, detail="start_page 从 1 开始")
+    if request.mode == "recent":
+        if not request.limit or request.limit < 1:
+            raise HTTPException(status_code=400, detail="「最近 N 个」需要一个正整数 limit")
+        if request.limit > 1000:
+            raise HTTPException(status_code=400, detail="单次最多取 1000 条，请分批拉取")
+    max_pages = request.max_pages or bili_space.DEFAULT_MAX_PAGES
+    if max_pages < 1 or max_pages > 50:
+        raise HTTPException(status_code=400, detail="max_pages 取 1–50")
+
+    if request.bilibili_cookie:
+        cookie: dict[str, str] | None = request.bilibili_cookie.model_dump()
+    else:
+        try:
+            cookie = config_store.load_bili_credentials()
+        except BiliCredentialsUnavailable:
+            cookie = None
+
+    result = await asyncio.to_thread(
+        bili_space.fetch_up_videos,
+        request.uid,
+        mode=request.mode,
+        limit=request.limit,
+        start_page=request.start_page,
+        max_pages=max_pages,
+        cookie=cookie,
+        # 拉到的地址存本地（workspace/up_lists/<uid>.json），下次用 incremental 只取新增
+        cache_dir=WORKSPACE_DIR,
+    )
+    return result.as_dict()
+
+
+class BiliSpaceCrawlRequest(BaseModel):
+    """`POST /api/bili-space-crawl` 的请求体：用浏览器抓 space 页面。"""
+
+    url: str
+    max_attempts: int | None = None
+
+
+@app.post("/api/bili-space-crawl")
+async def crawl_space_page(request: BiliSpaceCrawlRequest) -> dict[str, Any]:
+    """用真实浏览器打开 space 页面并滚动抓取全部视频地址。
+
+    与 `/api/bili-space-videos`（直连投稿接口）互补：那条路未登录时按 IP 限流，
+    这条路走页面自己的请求路径，实测通过率明显更高；代价是要开一个浏览器窗口。
+
+    页面数据请求偶发失败时 B 站会把列表显示成"还没有投过视频"，所以抓取会用页面
+    顶部的总数校验并自动重开页面重试，不会把一次网络抖动当成"这个 UP 主没视频"。
+    抓到的地址并入同一份本地缓存，两条路线的地址汇在一起。
+    """
+    try:
+        space_page.parse_space_input(request.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    max_attempts = request.max_attempts or space_page.DEFAULT_MAX_ATTEMPTS
+    if max_attempts < 1 or max_attempts > 10:
+        raise HTTPException(status_code=400, detail="max_attempts 取 1–10")
+
+    result = await asyncio.to_thread(
+        space_page.crawl_space_page,
+        request.url,
+        cache_dir=WORKSPACE_DIR,
+        max_attempts=max_attempts,
+    )
+    return result.as_dict()
 
 
 @app.get("/api/health")

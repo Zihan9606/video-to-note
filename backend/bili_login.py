@@ -6,6 +6,10 @@ app-bound 加密），因此用独立配置启动 Edge/Chrome 并开启调试端
 
 登录态保存在工作目录的 _bili_profile 中，同机器后续导入无需重复登录。
 cookie 只保存在内存中，不落盘。
+
+macOS 上没有装 Edge/Chrome 时退回 Safari：它不支持 CDP，改走官方
+safaridriver（WebDriver）取 Cookie，代价是需要用你真实的 Safari 配置
+（没有独立 profile，好处是已经登过就直接拿到登录态），且首次要授权一次。
 """
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ from typing import Any
 
 import websockets
 
+from . import safari_driver
+
 LOGIN_URL = "https://passport.bilibili.com/login"
 SESSION_TTL_SECONDS = 300
 CDP_PORT_START = 9333
@@ -34,10 +40,13 @@ BROWSER_PATHS = [
     # Windows: Chrome
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    # macOS: Chrome / Edge
+    # macOS: Chrome / Edge（/Applications 与用户级 ~/Applications 都查）
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    str(Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+    str(Path.home() / "Applications/Chromium.app/Contents/MacOS/Chromium"),
 ]
 
 
@@ -60,6 +69,41 @@ def free_cdp_port() -> int | None:
     return None
 
 
+BILI_COOKIE_KEYS = (
+    "SESSDATA",
+    "bili_jct",
+    "buvid3",
+    "buvid4",
+    "b_nut",
+    "b_lsid",
+)
+
+
+def pick_bili_cookies(cookies: list[dict[str, Any]]) -> dict[str, str]:
+    """从浏览器 Cookie 列表里挑出 B 站会话字段。
+
+    CDP 的 Storage.getCookies 与 WebDriver 的 GET /session/{id}/cookie 返回的
+    结构一致（都是 name/value/domain...），所以两条路线共用这一份筛选逻辑，
+    保证 Safari 和 Chrome 拿到的字段完全相同。
+    """
+    wanted: dict[str, str] = {}
+    for cookie in cookies:
+        domain = str(cookie.get("domain") or "")
+        name = str(cookie.get("name") or "")
+        if "bilibili.com" in domain and name in BILI_COOKIE_KEYS:
+            wanted[name] = str(cookie.get("value") or "")
+    if not wanted.get("SESSDATA"):
+        return {}
+    return {
+        "sessdata": wanted.get("SESSDATA", ""),
+        "bili_jct": wanted.get("bili_jct", ""),
+        "buvid3": wanted.get("buvid3", ""),
+        "buvid4": wanted.get("buvid4", ""),
+        "b_nut": wanted.get("b_nut", ""),
+        "b_lsid": wanted.get("b_lsid", ""),
+    }
+
+
 @dataclass
 class BiliLoginSession:
     browser_path: str
@@ -70,6 +114,12 @@ class BiliLoginSession:
     state: str = "waiting"  # waiting | ready | failed | timeout
     message: str = ""
     cookies: dict[str, str] | None = None
+    # 走 Safari（WebDriver）路线时持有 safari_driver.SafariSession；CDP 路线为 None
+    safari: Any = None
+
+    @property
+    def is_safari(self) -> bool:
+        return self.safari is not None
 
 
 class BiliLoginManager:
@@ -85,7 +135,8 @@ class BiliLoginManager:
 
         browser = await asyncio.to_thread(find_browser)
         if not browser:
-            return {"ok": False, "error": "未找到 Edge 或 Chrome，请手动填写凭据"}
+            # macOS 上没装 Chromium 不等于没法扫码：退回 Safari（WebDriver 路线）
+            return await self._start_safari()
         port = free_cdp_port()
         if port is None:
             return {"ok": False, "error": "没有可用的调试端口，请稍后重试"}
@@ -147,6 +198,51 @@ class BiliLoginManager:
             asyncio.create_task(self.cancel())
         return self._describe()
 
+    async def _start_safari(self) -> dict[str, Any]:
+        """没有 Chromium 时的兜底：用 safaridriver 打开真实 Safari 扫码。
+
+        非 macOS 没有 safaridriver，直接回到原来的提示；macOS 上首次没授权时，
+        把 Apple 的原文翻成"去哪点一下"，而不是甩一句找不到浏览器。
+        """
+        if not safari_driver.safaridriver_path():
+            return {"ok": False, "error": "未找到 Edge 或 Chrome，请手动填写凭据"}
+        try:
+            browser_session = await asyncio.to_thread(safari_driver.start_session)
+        except safari_driver.SafariError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        profile_dir = self.profile_root / "_bili_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        self.session = BiliLoginSession(
+            browser_path="Safari",
+            profile_dir=profile_dir,
+            cdp_port=browser_session.port,
+            started_at=time.time(),
+            process=browser_session.process,
+            safari=browser_session,
+        )
+        try:
+            await asyncio.to_thread(safari_driver.navigate, browser_session, LOGIN_URL)
+        except safari_driver.SafariError as exc:
+            self._terminate_browser()
+            return {"ok": False, "error": str(exc)}
+
+        cookies: dict[str, str] | None = None
+        for _ in range(30):
+            if not self._alive():
+                break
+            cookies = await self._fetch_cookies()
+            if cookies:
+                break
+            await asyncio.sleep(0.25)
+        if cookies:
+            # 真实 Safari profile 里通常已登过：和 Chromium 一样直接完成
+            self.session.cookies = cookies
+            self.session.state = "ready"
+            self.session.message = "已从上次 Safari 登录态恢复"
+            asyncio.create_task(self.cancel())
+        return self._describe()
+
     def _alive(self) -> bool:
         session = self.session
         if not session or not session.process:
@@ -155,6 +251,12 @@ class BiliLoginManager:
 
     def _terminate_browser(self) -> None:
         session = self.session
+        if session and session.is_safari:
+            # Safari 用的是真实 profile，没有可枚举的独立 user-data-dir，
+            # 关闭会话本身就够了（顺带关掉它开的窗口）
+            safari_driver.close_session(session.safari)
+            self.session = None
+            return
         if session and session.process and session.process.poll() is None:
             try:
                 session.process.terminate()
@@ -259,6 +361,12 @@ class BiliLoginManager:
         session = self.session
         if not session:
             return {}
+        if session.is_safari:
+            try:
+                jar = await asyncio.to_thread(safari_driver.cookies, session.safari)
+            except safari_driver.SafariError:
+                return {}
+            return pick_bili_cookies(jar)
         try:
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{session.cdp_port}/json/version", timeout=2
@@ -277,35 +385,17 @@ class BiliLoginManager:
                         break
         except Exception:
             return {}
-        wanted: dict[str, str] = {}
-        wanted_keys = (
-            "SESSDATA",
-            "bili_jct",
-            "buvid3",
-            "buvid4",
-            "b_nut",
-            "b_lsid",
-        )
-        for cookie in cookies:
-            domain = cookie.get("domain", "")
-            name = cookie.get("name", "")
-            if "bilibili.com" in domain and name in wanted_keys:
-                wanted[name] = cookie.get("value", "")
-        if not wanted.get("SESSDATA"):
-            return {}
-        return {
-            "sessdata": wanted.get("SESSDATA", ""),
-            "bili_jct": wanted.get("bili_jct", ""),
-            "buvid3": wanted.get("buvid3", ""),
-            "buvid4": wanted.get("buvid4", ""),
-            "b_nut": wanted.get("b_nut", ""),
-            "b_lsid": wanted.get("b_lsid", ""),
-        }
+        return pick_bili_cookies(cookies)
 
     async def cancel(self) -> dict[str, Any]:
         session = self.session
         if not session:
             return {"ok": True, "message": "无进行中的登录会话"}
+        if session.is_safari:
+            await asyncio.to_thread(safari_driver.close_session, session.safari)
+            if not session.cookies:
+                self.session = None
+            return {"ok": True, "message": "登录会话已结束"}
         process = session.process
         if process and process.poll() is None:
             try:

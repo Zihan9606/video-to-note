@@ -5,7 +5,8 @@
 
 文件位置：
 - workspace/llm_keys.json          按接口地址（host + path）保管的 API Key，
-                                   Windows 下用 DPAPI 加密，其他平台明文并如实上报存储方式
+                                   Windows 用 DPAPI、macOS 用钥匙串加密，
+                                   其余平台明文并如实上报存储方式
 - workspace/llm_config.json        旧版单份明文配置：仅作一次性迁移的来源，迁移后只留设置与说明
 - workspace/bili_credentials.json  B 站凭据：SESSDATA / bili_jct 用同一套信封加密，
                                    buvid3 是设备标识（请求里本就明文）保持明文
@@ -48,7 +49,7 @@ def _now() -> str:
 
 
 class BiliCredentialsUnavailable(RuntimeError):
-    """本机存过 B 站凭据但解不开（换机器 / 换 Windows 账户 / 盐值丢失）。
+    """本机存过 B 站凭据但解不开（换机器 / 换系统账户 / 盐值丢失）。
 
     与"从未保存过"必须区分：静默当成未登录会让任务改用匿名请求，
     失败原因漂到 412 风控上，用户完全看不出是凭据的问题。
@@ -328,7 +329,7 @@ class ConfigStore:
         except secret_box.SecretBoxError as error:
             LOGGER.warning("本机 B 站凭据解密失败（%s）：%s", error.code, error)
             raise BiliCredentialsUnavailable(
-                f"本机 B 站凭据无法解密（{error.code}），可能来自其他机器或另一个 Windows 账户。"
+                f"本机 B 站凭据无法解密（{error.code}），可能来自其他机器或另一个系统账户。"
                 "请重新扫码登录导入，或用 save_bilibili_credentials 再保存一次"
             ) from error
 

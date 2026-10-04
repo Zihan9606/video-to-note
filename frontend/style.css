@@ -275,6 +275,16 @@ button, select { cursor: pointer; }
 .bili-page-item:hover { background: var(--hover); }
 .bili-page-item.is-checked { background: var(--blue-soft); }
 .bili-page-item input { flex: none; }
+
+/* 按 UID 拉投稿列表 */
+.up-list-section summary { cursor: pointer; }
+.up-list-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.up-list-controls .field { flex: 0 0 auto; margin-bottom: 0; }
+.up-list-controls .up-uid-field { flex: 1 1 240px; min-width: 200px; }
+.up-list-section #upStatus:not(:empty) { display: block; overflow-wrap: anywhere; }
+.up-list-section #upStatus.error { color: var(--danger, #f85149); }
+.up-list-section #upStatus.warn { color: var(--text-soft); }
+.up-video-item .bili-page-name { flex: 1 1 auto; min-width: 0; }
 .bili-page-index {
     flex: none;
     min-width: 30px;
@@ -401,6 +411,8 @@ input[type="checkbox"] {
 .sidebar-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 20px 4px 0; }
 .sidebar-actions .button { flex: 1 1 auto; }
 .sidebar-actions p { flex: 1 1 100%; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
+.sidebar-action-row { display: flex; gap: 8px; flex: 1 1 100%; }
+.sidebar-action-row .button { flex: 1 1 0; min-width: 0; }
 
 .button {
     min-height: 40px;

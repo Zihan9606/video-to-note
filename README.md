@@ -9,7 +9,7 @@
 
 <p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="最新版本"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
 
-<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ 下载 Windows 便携版</strong></a></p>
+<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ 下载 Windows 便携版 / macOS 版</strong></a></p>
 
 <p align="center">🎬 宣传视频：<a href="https://www.bilibili.com/video/BV1Qwby6DEu1/">https://www.bilibili.com/video/BV1Qwby6DEu1/</a> &nbsp;·&nbsp; 👥 QQ 交流群：<code>739200648</code></p>
 
@@ -62,14 +62,14 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 
 ## 🚀 便携版下载（推荐）
 
-普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.2-portable.exe`：
+普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.2-portable.exe`（Windows）或 `VideoToNo-1.4.2-macos.zip`（Apple Silicon Mac）：
 
-1. 下载并双击 exe；
+1. Windows：下载并双击 exe；macOS：解压后双击 `VideoToNo.app`——从网上下载的包首次打开会被 Gatekeeper 拦下，在「系统设置 → 隐私与安全性」里点「仍要打开」，或在终端执行 `xattr -dr com.apple.quarantine VideoToNo.app`；
 2. 等待浏览器自动打开本地页面；
 3. 粘贴视频链接或上传本地文件：要成品笔记就先填 Provider、模型和 API Key；**只要带时间轴的字幕稿，选「仅转录字幕」即可，什么都不用填**；
 4. 等待生成笔记或字幕稿。
 
-便携版会自动启动本地服务并驻留系统托盘。第一次使用 Whisper 转写时需要下载模型，请保持网络畅通；生成的任务、转录、截图和笔记默认保存在 exe 同目录的 `workspace/` 中。
+便携版会自动启动本地服务并驻留系统托盘（Windows 是任务栏托盘，macOS 是菜单栏图标，从那里退出）。第一次使用 Whisper 转写时需要下载模型，请保持网络畅通；生成的任务、转录、截图和笔记默认保存在应用旁边的 `workspace/` 中——应用放在 `/Applications` 这类不可写目录时会自动改存到 `~/Library/Application Support/VideoToNo/workspace/`。
 
 ## ✨ 主要功能
 
@@ -80,6 +80,10 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 - 🧠 **长内容整理**：短转录直接生成，长转录自动分块、归并并控制上下文压力；生成后会核对是否写到材料结尾，小缺口自动补写。
 - 🖼️ **多格式输出**：Markdown 笔记、HTML、JSON、纯文本和 PNG 图片；可选提取视频截图作为附件。
 - 🤖 **给 agent 留了原料出口**：接入的 agent 只要「带时间轴转录」，可以不走大模型、不需要给本机配 API Key，笔记风格由 agent 自己定。
+- 📋 **按 UID 批量取址**：输入 UP 主 UID 取投稿地址——**只有「全部视频」和「最近 N 个」两个选项，两者共用同一套增量存储**：地址存本机 `workspace/up_lists/<uid>.json`，首次拉全后，之后每次只补新增（撞到已知视频即停），所以不会反复撞 B 站限流。
+- 🕷️ **浏览器抓取（拿全量更稳，且带增量）**：粘贴空间链接（如 `space.bilibili.com/123456/upload/video`），用 Playwright 打开真实 Chromium 加载页面、**逐页点分页器**并拦截页面自己的接口响应——字段最全（标题 + 精确投稿时间），实测 185 条一次抓全。**同样走增量**：本地已完整时只看第 1 页（有无新视频），缺过哪几页就只补哪几页；被拦的页会记进缓存，下次直奔它去，不必再从头翻 5 页。
+- ▶️ **选中即转写**：列表勾好之后点「逐个转写选中（N）」，地址就不用再复制到别处——后端按 `MAX_CONCURRENT_TASKS` 逐个排队执行（仅转录，不需要 API Key），进度在「最近任务」里看。
+- 📂 **一键打开文件**：侧栏「打开转写目录」定位所有产物，任务结果区「打开所在文件夹」直接进当前这条的输出目录（只接受本机任务 ID，不接受任意路径）。
 - 🛡️ **本地优先**：媒体下载、转录和文件生成在本机完成；服务默认只监听 `127.0.0.1`。
 
 ## 🔁 处理流程
@@ -110,28 +114,60 @@ faster-whisper 本地转写
 1. 选输出类型：**生成笔记**（要配 API Key）或 **仅转录字幕**（只要一份带时间轴的字幕稿，全程不调用大模型、**不需要 API Key**，笔记风格与推理强度这些设置会自动收起）；
 2. 生成笔记时选择模型档案并填写 API Key：DeepSeek / OpenAI / 智谱 / 通义 / Kimi 各自记住自己的模型，自定义 OpenAI 兼容接口可以保存多个命名档案，切换档案不会互相覆盖设置；
 3. 选择笔记风格、推理强度和 Whisper 模型（推理强度保持 `auto` 时，详细类笔记会用更高思考档，任务日志会打印实际生效档位）；
-4. 粘贴视频链接，或切换为本地文件上传；
+4. 粘贴视频链接，或切换为本地文件上传；要批量处理某个 UP 主，展开「按 UID 拉投稿列表」，填 UID 后取地址（**只读，不会开始转写**），勾选后可一键复制链接，也可以直接点「逐个转写选中（N）」排队转写——「全部视频」和「最近 N 个」都会顺手把本地存全，首次贵、之后每次都只补新增；**接口一直被限流就改用下面那行的「浏览器抓取」**：粘贴空间链接，它会打开浏览器把分页一页页点完；
 5. 生成完成后预览、复制或下载结果。字幕稿会留在「最近任务」里（标题前带「转录」标记）随时回看和下载，也可以点「基于字幕稿生成笔记」改走笔记路线——转录不重跑，只补一次大模型调用。
 
-模型档案、识别参数和主题等非敏感设置会自动记在本机浏览器里，改动即生效，不需要手动保存。API Key 默认只留在当前页面内存中，刷新即失效；点「保存到本机」后才会写入 `workspace/llm_keys.json`——Windows 上用系统自带的 DPAPI 加密（换机器或换 Windows 账户就解不开，需要重填），其他平台会明文保存并在界面标注。**已保存的 Key 与接口地址绑定**：只有目标地址与保存时一致才会复用，绝不会发给别的网关。扫码取得的 B 站 Cookie 仍只保留在本机进程内，只有显式保存时才会落盘，请勿分享工作目录里的这些文件。
+模型档案、识别参数和主题等非敏感设置会自动记在本机浏览器里，改动即生效，不需要手动保存。API Key 默认只留在当前页面内存中，刷新即失效；点「保存到本机」后才会写入 `workspace/llm_keys.json`——Windows 上用系统自带的 DPAPI 加密、macOS 上用系统钥匙串保存主密钥（两者都是换机器或换系统账户就解不开，需要重填），其余平台会明文保存并在界面标注。**已保存的 Key 与接口地址绑定**：只有目标地址与保存时一致才会复用，绝不会发给别的网关。扫码取得的 B 站 Cookie 仍只保留在本机进程内，只有显式保存时才会落盘，请勿分享工作目录里的这些文件。
 
 <details>
 <summary>🧑‍💻 源码运行与构建（开发者）</summary>
 
-源码用户直接 `git clone` 或在 GitHub 选择 **Code → Download ZIP** 即可获取完整项目。项目主要面向 Windows + Python 3.11，安装 `backend/requirements.txt` 后可使用 `start.ps1` 启动；需要自行构建便携版时运行：
+源码用户直接 `git clone` 或在 GitHub 选择 **Code → Download ZIP** 即可获取完整项目。**Windows 与 macOS 共用同一个仓库、同一条命令**：
 
-```powershell
+```bash
 git clone https://github.com/like-attract/video-to-note.git
 cd video-to-note
+python3 scripts/bootstrap.py     # Windows 用 python：建 .venv、装依赖、修证书
+python3 scripts/manage.py start  # 启动（占用 8000 时加 --port 8011）
+```
+
+`scripts/manage.py` 在两个平台上是同一条命令，内部再分发到 `start.ps1` / `start.sh`，所以调用方（包括 agent，见仓库根的 `AGENTS.md`）不需要记两套用法。其余子命令：`stop [--all]`、`restart`、`status`、`test`、`build`。
+
+<details>
+<summary>按平台手敲启停脚本（等价写法）</summary>
+
+Windows：
+
+```powershell
 .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 .\start.ps1
 ```
 
-构建 Windows 便携版：
+macOS（Linux 同样可用）：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+./start.sh
+```
+
+`start.sh` 与 `start.ps1` 参数一致（`--foreground` / `--restart` / `--no-browser` / `--bind-host` / `--port`），配对的 `stop.sh`（`--quiet` / `--all`）与 `restart.sh` 亦然；日志和状态文件同样在 `.runtime/`。用 python.org 安装包建的虚拟环境若报 `certificate verify failed`，`start.sh` 会自动设 `SSL_CERT_FILE=/etc/ssl/cert.pem`，也可手动执行 `./.venv/bin/python "Install Certificates.command"`，否则 `yt-dlp` 与模型下载都会失败。
+
+</details>
+
+构建便携版：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
+
+构建 macOS 应用包（产出 `dist/VideoToNo.app`）：
+
+```bash
+./scripts/build_app.sh
+```
+
+两个平台也可以统一写成 `python scripts/manage.py build`。
 
 </details>
 
@@ -160,10 +196,12 @@ VideoToNo 内置 MCP（Model Context Protocol）服务，可以在 Cherry Studio
 | `transcribe_video` | 只做到带时间轴转录为止，全程不调用大模型，**因此不需要 API Key**；适合客户端自己写笔记 |
 | `get_transcript` | 取某个任务的转录正文（整篇 markdown 或 json 分段）；历史任务即便后来生成笔记失败，转录照样能取 |
 | `wait_for_task` | 等待任务达到终态（最长 45 秒，可重复调用），适合代替频繁轮询；笔记任务会连正文一起返回，转录任务只回状态与提示，正文请用 `get_transcript` 取 |
+| `list_up_videos` | 按 UID 取 UP 主投稿地址，只有 `mode="all"`（全部）和 `mode="recent"`（最近 N 条）两个取值，**两者共用同一套增量存储**：本地为空就按需拉全，本地不完整就从断点续传补齐，本地完整则只翻到第一个已知视频为止（通常一两个请求）。`added` 是本次新增、`cached_count` 是本地总数；B 站按 IP 限流，用 `complete` 判断是否拉完 |
+| `crawl_space_page` | **浏览器抓取**：用 Playwright 打开空间链接、逐页点分页器、拦截页面自己的接口响应，拿全量地址与标题/时间。接口路线被限流时用它，代价是会开一个 Chromium 窗口。首次需要 `.venv/bin/python -m playwright install chromium` |
 | `get_task_status` | 查询任务中间进度 |
 | `list_whisper_models` | 查看 Whisper 模型的本地缓存状态 |
-| `save_llm_config` | 把某个接口地址的 Provider、模型和 API Key 保存到本机（Windows 加密，其他平台明文并提示），之后对该地址调用 `summarize_video` 无需再传 |
-| `save_bilibili_credentials` | 把 B 站凭据（SESSDATA 等）保存到本机，与 API Key 同一套本机加密（Windows 加密，其他平台明文并提示），处理 B 站视频时自动使用 |
+| `save_llm_config` | 把某个接口地址的 Provider、模型和 API Key 保存到本机（Windows 用 DPAPI、macOS 用钥匙串加密，其余平台明文并提示），之后对该地址调用 `summarize_video` 无需再传 |
+| `save_bilibili_credentials` | 把 B 站凭据（SESSDATA 等）保存到本机，与 API Key 同一套本机加密（Windows 用 DPAPI、macOS 用钥匙串加密，其余平台明文并提示），处理 B 站视频时自动使用 |
 | `list_llm_keys` | 查看本机已保存密钥的接口地址列表（只返回掩码与加密方式） |
 | `get_saved_config` | 查看已保存配置的状态，敏感信息会脱敏显示 |
 
@@ -207,7 +245,7 @@ codex mcp add local videotono -- python -m backend.mcp_server
 
 MCP server 会自动扫描 8000–8019 端口来找到已运行的 VideoToNo 服务；也可以用环境变量 `VIDEOTONOTES_BACKEND_URL` 显式指定服务地址。
 
-> 隐私说明：`save_llm_config`（以及网页端的「保存到本机」）把 API Key 写入本机 `workspace/llm_keys.json`——Windows 上用系统 DPAPI 按当前用户加密，把该文件拷到另一台机器或另一个 Windows 账户都解不开；非 Windows 平台没有 DPAPI，会明文保存并在界面标注。Key 与保存时的接口地址绑定，只有目标地址一致才会复用。`save_bilibili_credentials` 保存的 SESSDATA / bili_jct 走同一套信封加密写入 `workspace/bili_credentials.json`（同样绑定当前 Windows 账户，换机器需重新保存；`buvid3` 是设备标识，客户端本就明文携带，故保持明文）。未显式调用保存工具时，凭据不会落盘；`workspace/` 已被 `.gitignore` 排除，不会进入 Git 仓库，也请勿分享这些文件。
+> 隐私说明：`save_llm_config`（以及网页端的「保存到本机」）把 API Key 写入本机 `workspace/llm_keys.json`——Windows 上用系统 DPAPI 按当前用户加密，macOS 上用系统钥匙串存一把主密钥、文件里只留密文，把该文件拷到另一台机器或另一个系统账户都解不开；其余平台没有可用的系统密钥库，会明文保存并在界面标注。Key 与保存时的接口地址绑定，只有目标地址一致才会复用。`save_bilibili_credentials` 保存的 SESSDATA / bili_jct 走同一套信封加密写入 `workspace/bili_credentials.json`（同样绑定当前系统账户，换机器需重新保存；`buvid3` 是设备标识，客户端本就明文携带，故保持明文）。未显式调用保存工具时，凭据不会落盘；`workspace/` 已被 `.gitignore` 排除，不会进入 Git 仓库，也请勿分享这些文件。
 
 </details>
 
@@ -268,6 +306,36 @@ agent 会调用技能附带的 `scripts/video_note.py`，自动探测服务端�
 ### CPU 转写为什么比视频时长还久？
 
 速度取决于 CPU、视频时长和模型大小。CPU 模式使用 `int8` 降低资源压力，但 `medium`、`large-v3` 和 `turbo` 仍可能较慢并占用较多内存。个人电脑建议先使用 `base`；确认 CUDA 环境可用后再启用 GPU。
+
+### macOS 上点「扫码登录导入」提示需要授权？
+
+没装 Chrome / Edge 的 Mac 会自动改用 Safari 打开登录页。Safari 不支持 Chrome 的调试协议，
+程序读它的 Cookie 走的是官方 `safaridriver`，**首次需要授权一次**：
+
+1. Safari 设置 → 高级 → 勾选「在菜单栏中显示开发菜单」；
+2. 菜单栏 开发 → 允许远程自动化（等价于终端执行 `sudo safaridriver --enable`）；
+3. 回到页面再点一次「扫码登录导入」。
+
+授权一次之后长期有效。注意 Safari 用的是你**真实的浏览器配置**（不像 Chrome 那样开独立
+profile），好处是已经登过就直接拿到登录态。装了 Chrome/Edge 时优先用它们，无需任何授权。
+
+### 拉 UP 主列表时提示被限流（412 / -352 / -403）？
+
+B 站对空间投稿接口按 **IP + 登录态**限流，连续翻页必然触发，而且要冷却一段时间。
+本项目按优先级做了这些缓解，按建议顺序用：
+
+1. **靠增量存储，别重复全量拉**：两个选项（全部视频 / 最近 N 个）共用一份
+   `workspace/up_lists/<uid>.json`——首次拉全之后，每次调用只翻到第一个已知视频就停，
+   通常**一个请求**；上一批没拉完的缺口会自动从断点续传补齐，不用从第 1 页重来。
+2. **扫码登录导入凭据**：登录态的风控宽松得多，这是单点收益最大的一步。
+3. **拉取本身带护栏**：页间强制延迟、指数退避重试、半路被拦时**返回已拿到的部分**并给
+   `next_page` 续传，不会整批丢弃。
+4. **换 IP（可选，需要你自己有代理）**：B 站相关请求走标准代理环境变量，
+   设 `HTTPS_PROXY=http://127.0.0.1:7890 ./start.sh` 即可让拉取走代理；`yt-dlp` 降级路线
+   同样认这个变量。注意 B 站对机房 IP 反而更敏感，住宅代理才有明显效果——本项目不提供、
+   也不代理任何第三方 IP 源。
+
+限流是临时的：停一会儿再试即可，已拉到的数据不会丢。
 
 ### 为什么需要 B 站 Cookie？
 

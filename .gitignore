@@ -34,6 +34,9 @@ Thumbs.db
 /sources/icon_old.*
 # 构建产物（由 build_exe.ps1 从模板生成）
 /scripts/version_info.txt
+# 构建产物（由 build_app.sh 从 sources/icon.png 生成）
+/sources/icon.icns
+/sources/icon.iconset/
 
 # 视频宣传脚本
 /promo/

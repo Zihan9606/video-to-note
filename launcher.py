@@ -38,12 +38,18 @@ def is_frozen() -> bool:
 
 def base_dir() -> Path:
     if is_frozen():
-        return Path(sys.executable).resolve().parent
+        executable_dir = Path(sys.executable).resolve().parent
+        # macOS 的 .app 里可执行文件在 Contents/MacOS 下，便携工作目录要落在 .app 旁边
+        # （对应 Windows 的 exe 旁边），不能塞进 bundle 内部——升级换包时会被整个删掉。
+        parts = executable_dir.parts
+        if sys.platform == "darwin" and len(parts) >= 4 and parts[-1] == "MacOS" and parts[-2] == "Contents":
+            return executable_dir.parents[2]
+        return executable_dir
     return Path(__file__).resolve().parent
 
 
 def configure_runtime_dirs() -> None:
-    """设置工作目录：打包模式默认放在 exe 旁边（便携），允许环境变量覆盖。"""
+    """设置工作目录：打包模式默认放在应用旁边（便携），允许环境变量覆盖。"""
     if is_frozen():
         exe_dir = base_dir()
         default_workspace = exe_dir / "workspace"
@@ -53,9 +59,15 @@ def configure_runtime_dirs() -> None:
             probe.write_text("", encoding="utf-8")
             probe.unlink()
         except OSError:
-            # exe 所在目录不可写时（如 Program Files），退回用户目录
+            # 应用所在目录不可写时（如 /Applications、Program Files）退回用户目录
             local_app_data = os.environ.get("LOCALAPPDATA")
-            fallback_root = Path(local_app_data) if local_app_data else Path.home() / ".videotono"
+            if local_app_data:
+                fallback_root = Path(local_app_data)
+            elif sys.platform == "darwin":
+                # 对应 Windows 的 %LOCALAPPDATA%（AppData\Local）的 macOS 惯例位置
+                fallback_root = Path.home() / "Library" / "Application Support"
+            else:
+                fallback_root = Path.home() / ".videotono"
             default_workspace = fallback_root / "VideoToNo" / "workspace"
             default_workspace.mkdir(parents=True, exist_ok=True)
     else:
@@ -200,14 +212,40 @@ def setup_file_logging(workspace: Path) -> Path:
     return log_path
 
 
+def _applescript_string(value: str) -> str:
+    """转义成 AppleScript 字符串字面量；换行保留原样（AppleScript 允许字符串跨行）。"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _run_applescript(script: str) -> str:
+    """执行一段 AppleScript 并返回 stdout；命令失败或工具缺失返回空串。"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def show_error(message: str) -> None:
-    """启动失败提示：Windows 弹消息框，其他平台写 stderr。"""
+    """启动失败提示：Windows 弹消息框、macOS 弹系统警告，其余平台写 stderr。"""
     if sys.platform == "win32":
         import ctypes
 
         ctypes.windll.user32.MessageBoxW(None, message, f"{APP_NAME} 启动失败", 0x10)
-    else:
-        print(message, file=sys.stderr, flush=True)
+        return
+    if sys.platform == "darwin":
+        # 打包版没有控制台，写 stderr 等于没人看得见
+        _run_applescript(
+            f'display alert "{_applescript_string(APP_NAME)} 启动失败" '
+            f'message "{_applescript_string(message)}" as critical'
+        )
+        return
+    print(message, file=sys.stderr, flush=True)
 
 
 def open_in_shell(path: Path) -> None:
@@ -254,11 +292,29 @@ def latest_release_info() -> dict[str, str]:
 
 
 def show_update_message(message: str, title: str = APP_NAME, flags: int = 0x40) -> int:
-    """显示更新提示；开发模式/非 Windows 下退回日志，便于测试。"""
+    """显示更新提示；Windows 用消息框，macOS 用系统对话框，其余平台退回日志便于测试。
+
+    返回值沿用 Windows 的 IDYES(6) / IDNO(7)，调用方 `result == 6` 这条判断因此在
+    两个平台上语义一致。
+    """
     if sys.platform == "win32":
         import ctypes
 
         return int(ctypes.windll.user32.MessageBoxW(None, message, title, flags))
+    if sys.platform == "darwin":
+        if flags & 0x4:  # MB_YESNO：问"要不要打开 Release 页面"
+            returned = _run_applescript(
+                f'display dialog "{_applescript_string(message)}" '
+                f'with title "{_applescript_string(title)}" '
+                f'buttons {{"否", "是"}} default button "是"'
+            )
+            return 6 if "button returned:是" in returned else 7
+        _run_applescript(
+            f'display dialog "{_applescript_string(message)}" '
+            f'with title "{_applescript_string(title)}" '
+            f'buttons {{"好"}} default button "好"'
+        )
+        return 0
     print(f"{title}: {message}", file=sys.stderr, flush=True)
     return 0
 

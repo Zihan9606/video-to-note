@@ -9,12 +9,35 @@ from backend import mcp_server
 
 class FakeBackend:
     def __init__(self, response=None, captured=None, llm_config=None, bili_config=None,
-                 keys=None):
+                 keys=None, up_response=None, crawl_response=None):
         self.response = response or {"ok": True, "task_id": "task-1", "reused_task_id": None}
         self.captured = captured or {}
         self.llm_config = llm_config or {"saved": False}
         self.bili_config = bili_config or {"saved": False}
         self.keys = keys or {"storage": {"algorithm": "plain-v1", "secure": False}, "entries": []}
+        self.up_response = up_response or {
+            "uid": 0,
+            "videos": [],
+            "count": 0,
+            "total": None,
+            "page": 1,
+            "fetched_pages": 0,
+            "next_page": None,
+            "complete": True,
+            "source": "space_api",
+            "message": "",
+        }
+        self.crawl_response = crawl_response or {
+            "url": "",
+            "uid": "",
+            "videos": [],
+            "count": 0,
+            "total": None,
+            "attempts": 1,
+            "rounds": 1,
+            "source": "space_page",
+            "message": "",
+        }
         self.llm_config_reads = 0
         self.saved_llm = None
         self.saved_bili = None
@@ -58,6 +81,14 @@ class FakeBackend:
     async def save_bili_credentials(self, credentials):
         self.saved_bili = credentials
         return {"saved": True}
+
+    async def up_videos(self, payload):
+        self.captured["up_payload"] = payload
+        return {**self.up_response, "uid": payload.get("uid", 0)}
+
+    async def crawl_space(self, payload):
+        self.captured["crawl_payload"] = payload
+        return {**self.crawl_response, "url": payload.get("url", "")}
 
 
 SAVED_LLM = {
@@ -267,6 +298,87 @@ async def test_list_llm_keys_passes_masked_listing_through(monkeypatch) -> None:
 
     assert listing["storage"] == {"algorithm": "plain-v1", "secure": False}
     assert listing["entries"][0]["api_key_masked"] == "sk-a****"
+
+
+@pytest.mark.asyncio
+async def test_list_up_videos_defaults_to_all_mode(monkeypatch) -> None:
+    fake = FakeBackend()
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    await mcp_server.list_up_videos(uid=672328094)
+
+    payload = fake.captured["up_payload"]
+    assert payload == {"uid": 672328094, "mode": "all", "start_page": 1}, (
+        "all 模式不该塞 limit，否则后端会按 recent 处理"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_up_videos_recent_supplies_default_limit(monkeypatch) -> None:
+    fake = FakeBackend()
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    await mcp_server.list_up_videos(uid=1, mode="recent")
+
+    assert fake.captured["up_payload"]["limit"] == 20
+
+
+@pytest.mark.asyncio
+async def test_list_up_videos_explains_how_to_continue(monkeypatch) -> None:
+    """半路被风控时 hint 必须给出可直接复制的续传调用，否则 agent 会当成失败。"""
+    fake = FakeBackend(
+        up_response={
+            "uid": 0, "videos": [], "count": 30, "total": 900, "page": 1,
+            "fetched_pages": 1, "next_page": 2, "complete": False,
+            "source": "space_api", "message": "已拿到前 1 页",
+        }
+    )
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    result = await mcp_server.list_up_videos(uid=7, mode="all")
+
+    assert "start_page=2" in result["hint"]
+    assert "uid=7" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_list_up_videos_rejects_unknown_mode(monkeypatch) -> None:
+    fake = FakeBackend()
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    with pytest.raises(RuntimeError, match="mode"):
+        await mcp_server.list_up_videos(uid=1, mode="everything")
+
+
+@pytest.mark.asyncio
+async def test_crawl_space_page_passes_url_and_clamps_attempts(monkeypatch) -> None:
+    fake = FakeBackend()
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    await mcp_server.crawl_space_page(
+        "https://space.bilibili.com/3546865492560315/upload/video", max_attempts=99
+    )
+
+    assert fake.captured["crawl_payload"] == {
+        "url": "https://space.bilibili.com/3546865492560315/upload/video",
+        "max_attempts": 10,
+    }, "重开次数必须夹在 1-10，否则一次失败会开十几轮浏览器"
+
+
+@pytest.mark.asyncio
+async def test_crawl_space_page_reports_counts_in_hint(monkeypatch) -> None:
+    fake = FakeBackend(
+        crawl_response={
+            "url": "", "uid": "1", "videos": [], "count": 40, "total": 185,
+            "attempts": 2, "rounds": 5, "source": "space_page", "message": "",
+        }
+    )
+    monkeypatch.setattr(mcp_server, "_get_backend", lambda: fake)
+
+    result = await mcp_server.crawl_space_page("space.bilibili.com/1/upload/video")
+
+    assert "40" in result["hint"]
+    assert "185" in result["hint"]
 
 
 class WaitingBackend(FakeBackend):

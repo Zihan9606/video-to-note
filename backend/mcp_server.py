@@ -36,6 +36,8 @@ warnings.filterwarnings("ignore", message=r"Field 'lifespan' has an incomplete d
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
 PORT_SCAN_RANGE = 20
 HTTP_TIMEOUT = httpx.Timeout(20.0)
+# UP 主投稿列表要一页页翻，还带页间延迟与退避重试，默认 20 秒会在正常情况下就超时
+UP_VIDEOS_TIMEOUT = httpx.Timeout(240.0)
 
 mcp = FastMCP(
     "VideoToNo",
@@ -117,6 +119,25 @@ class BackendClient:
     async def save_bili_credentials(self, credentials: dict[str, str]) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._request, "POST", "/api/bili-credentials", json=credentials
+        )
+
+    async def up_videos(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._request,
+            "POST",
+            "/api/bili-space-videos",
+            json=payload,
+            timeout=UP_VIDEOS_TIMEOUT,
+        )
+
+    async def crawl_space(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # 开浏览器 + 可能重开页面重试，比普通接口慢得多
+        return await asyncio.to_thread(
+            self._request,
+            "POST",
+            "/api/bili-space-crawl",
+            json=payload,
+            timeout=UP_VIDEOS_TIMEOUT,
         )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -216,6 +237,30 @@ class InProcessBackend:
         from .main import BiliCredentialsPayload, save_bili_credentials
 
         return await save_bili_credentials(BiliCredentialsPayload(**credentials))
+
+    async def up_videos(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from fastapi import HTTPException
+
+        from .main import BiliSpaceRequest, list_up_videos
+
+        try:
+            return await list_up_videos(BiliSpaceRequest(**payload))
+        except HTTPException as exc:
+            raise RuntimeError(
+                f"VideoToNo 后端返回错误（HTTP {exc.status_code}）：{exc.detail}"
+            ) from exc
+
+    async def crawl_space(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from fastapi import HTTPException
+
+        from .main import BiliSpaceCrawlRequest, crawl_space_page
+
+        try:
+            return await crawl_space_page(BiliSpaceCrawlRequest(**payload))
+        except HTTPException as exc:
+            raise RuntimeError(
+                f"VideoToNo 后端返回错误（HTTP {exc.status_code}）：{exc.detail}"
+            ) from exc
 
 
 _backend: BackendClient | InProcessBackend | None = None
@@ -533,6 +578,78 @@ async def list_whisper_models() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def list_up_videos(
+    uid: int,
+    mode: str = "all",
+    limit: int = 0,
+    start_page: int = 1,
+) -> dict[str, Any]:
+    """按 B 站 UID 拉取 UP 主投稿地址，供后续逐个转写。
+
+    只读投稿列表，不触发下载，也不调用大模型。
+
+    **两个选项共用同一套增量存储**（本机 `workspace/up_lists/<uid>.json`）：每次调用都会
+    顺手把本地存全——本地为空就按需拉全，本地不完整就从断点续传补齐，本地完整则只翻到
+    第一个已知视频为止。所以首次贵，之后 `all` 和 `recent` 都只要一两个请求，
+    这是绕开 B 站 IP 限流的关键。返回里的 `added` 是本次新增条数，`cached_count` 是本地总数。
+
+    B 站按 IP 限流：连续请求会被临时拒绝并需要冷却。本工具**永远返回已拿到的部分**——
+    `complete=false` 不算失败，把 `next_page` 原样传回 `start_page` 继续即可。
+
+    Args:
+        uid: UP 主的数字 UID（space.bilibili.com/<uid> 地址栏里那个）。
+        mode: all=全部视频（默认）/ recent=最近 N 条。两者都会增量更新本地缓存。
+        limit: mode="recent" 时要几条，缺省 20。
+        start_page: 从第几页继续，填上一次返回的 next_page（默认 1）。
+    """
+    if mode not in {"all", "recent"}:
+        raise RuntimeError('mode 只能是 "all"（全部视频）或 "recent"（最近 N 个）')
+    payload: dict[str, Any] = {"uid": uid, "mode": mode, "start_page": start_page}
+    if mode == "recent":
+        payload["limit"] = limit or 20
+    data = await _get_backend().up_videos(payload)
+    if data.get("next_page"):
+        data["hint"] = (
+            f"还没拉完（本地已有 {data.get('cached_count') or data.get('count')} 条）。继续拉："
+            f"list_up_videos(uid={uid}, mode=\"{mode}\", start_page={data['next_page']})"
+        )
+    else:
+        data["hint"] = (
+            f"本地已存 {data.get('cached_count') or 0} 条"
+            + (f"，本次新增 {data.get('added')} 条" if data.get("added") else "")
+            + f"。返回 {data.get('count')} 条地址。"
+        )
+    return data
+
+
+@mcp.tool()
+async def crawl_space_page(url: str, max_attempts: int = 4) -> dict[str, Any]:
+    """用真实浏览器打开 B 站空间页面并滚动抓取全部视频地址。
+
+    与 `list_up_videos`（直连投稿接口）互补：接口路线未登录时按 IP 限流、连续翻页
+    容易被 412/-352 挡住，这条路线走页面自己的请求路径，实测通过率高得多。代价是
+    **会打开一个浏览器窗口**，并且比接口路线慢（要等渲染 + 滚动加载）。
+
+    数据请求偶发失败时页面会假装成"还没有投过视频"，因此本工具用页面顶部的总数校验
+    并自动重开页面重试，不会把网络抖动报成"这个 UP 主没视频"。抓到的地址会并入
+    与 `list_up_videos` 相同的本地缓存。
+
+    Args:
+        url: 空间链接，如 `https://space.bilibili.com/123456/upload/video`（也接受纯 UID）。
+        max_attempts: 列表没渲染出来时最多重开几次页面，1-10，默认 4。
+    """
+    max_attempts = max(1, min(int(max_attempts or 4), 10))
+    data = await _get_backend().crawl_space({"url": url, "max_attempts": max_attempts})
+    if data.get("count"):
+        data["hint"] = (
+            f"抓到 {data.get('count')} 条地址"
+            + (f"（页面显示共 {data.get('total')} 条）" if data.get("total") else "")
+            + f"，重开页面 {data.get('attempts')} 次、滚动 {data.get('rounds')} 轮。"
+        )
+    return data
+
+
+@mcp.tool()
 async def save_llm_config(
     api_key: str,
     model_type: str = "deepseek",
@@ -540,7 +657,7 @@ async def save_llm_config(
     base_url: str | None = None,
     label: str | None = None,
 ) -> dict[str, Any]:
-    """把某个接口地址的大模型配置保存到本机（Windows 下用 DPAPI 加密，其他平台明文并如实上报）。
+    """把某个接口地址的大模型配置保存到本机（Windows 用 DPAPI、macOS 用钥匙串，其余平台明文并如实上报）。
 
     Key 与"接口地址"绑定：只有调用 summarize_video 时的 provider/base_url 指向同一个
     端点，才会复用这把 Key，不会把它发给别的网关。保存后调用 summarize_video
@@ -579,8 +696,9 @@ async def save_bilibili_credentials(
 
     保存后处理 B 站视频会自动携带这些凭据（优先使用 AI 字幕），无需每次传入。
     SESSDATA / bili_jct 用信封加密写入 workspace/bili_credentials.json，
-    Windows 上绑定当前登录账户（换机器或换账户就解不开，需重新保存）；
-    非 Windows 回退明文。实际存储方式看 /api/health 的 llm_key_storage。
+    Windows 上绑定当前登录账户（换机器或换账户就解不开，需重新保存），
+    macOS 上用钥匙串存主密钥（配置文件被拷走同样解不开）；
+    其余平台回退明文。实际存储方式看 /api/health 的 llm_key_storage。
     服务仅本机回环可访问，但仍不要把该文件或整个工作目录分享给别人。
     """
     await _get_backend().save_bili_credentials(

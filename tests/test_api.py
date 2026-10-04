@@ -2404,3 +2404,49 @@ def test_previous_bili_pages_returns_latest_explicit_selection(
         encoding="utf-8",
     )
     assert main.previous_bili_pages("https://www.bilibili.com/video/BV1ab") is None
+
+
+def test_open_directory_without_task_opens_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不带 task_id = 打开工作目录根，也就是所有转写文件的存放处。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    opened: list[Path] = []
+    monkeypatch.setattr(main, "_open_in_file_manager", lambda path: opened.append(path) or True)
+
+    data = TestClient(main.app).post("/api/open-directory", json={}).json()
+
+    assert data == {"opened": True, "path": str(tmp_path.resolve())}
+    assert opened == [tmp_path.resolve()]
+
+
+def test_open_directory_with_task_id_opens_that_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_dir = tmp_path / "task-abc"
+    task_dir.mkdir()
+    opened: list[Path] = []
+    monkeypatch.setattr(main, "_open_in_file_manager", lambda path: opened.append(path) or True)
+
+    data = TestClient(main.app).post("/api/open-directory", json={"task_id": "task-abc"}).json()
+
+    assert data["opened"] is True
+    assert opened == [task_dir.resolve()]
+
+
+def test_open_directory_rejects_paths_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只收任务 ID：否则这个端点就是一个"打开任意目录"的入口。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    opened: list[Path] = []
+    monkeypatch.setattr(main, "_open_in_file_manager", lambda path: opened.append(path))
+    client = TestClient(main.app)
+    (tmp_path / "outside").mkdir()
+
+    for bad in ("../outside", "..", "a/b", "does-not-exist", "/etc"):
+        response = client.post("/api/open-directory", json={"task_id": bad})
+        assert response.status_code in (400, 404), f"{bad} 竟然放行了"
+
+    assert opened == [], "校验不过时绝不能真的去开目录"

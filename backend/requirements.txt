@@ -12,3 +12,7 @@ Pillow>=10,<13
 pystray>=0.19,<1
 mcp>=1.0,<2
 websockets>=13,<16
+# macOS 钥匙串后端用它做 HKDF + AES-256-GCM（Windows 走 DPAPI，不依赖本包）
+cryptography>=42,<52
+# 页面抓取路线用它开真实浏览器（首次需 `.venv/bin/python -m playwright install chromium`）
+playwright>=1.45,<2

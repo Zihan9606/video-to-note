@@ -319,6 +319,17 @@ function bindEvents() {
     bindListener('biliPagesAllBtn', 'click', () => setBiliPagesSelection('all'));
     bindListener('biliPagesNoneBtn', 'click', () => setBiliPagesSelection('none'));
     bindListener('biliPagesInvertBtn', 'click', () => setBiliPagesSelection('invert'));
+    bindListener('upFetchBtn', 'click', () => fetchUpVideos(false));
+    bindListener('upMoreBtn', 'click', () => fetchUpVideos(true));
+    bindListener('upAllBtn', 'click', () => setUpSelection('all'));
+    bindListener('upNoneBtn', 'click', () => setUpSelection('none'));
+    bindListener('upCopyBtn', 'click', copySelectedUpUrls);
+    bindListener('upMode', 'change', toggleUpLimitField);
+    bindListener('upCrawlBtn', 'click', crawlSpacePage);
+    bindListener('upTranscribeBtn', 'click', transcribeSelectedUpVideos);
+    bindListener('openWorkspaceBtn', 'click', () => openDirectory(null));
+    bindListener('openTaskFolderBtn', 'click', () => openDirectory(currentTaskId));
+    toggleUpLimitField();
     initBiliLogin();
     bindListener('includeScreenshots', 'change', toggleScreenshotSettings);
     bindListener('localFile', 'change', () => {
@@ -1176,7 +1187,7 @@ function updateKeyControls() {
             : '已填入 Key，未保存则只在本次页面会话内有效';
         state = 'warn';
     } else if (keyMatch && keyMatch.key_state === 'undecryptable') {
-        text = '本机已存的 Key 无法解密（可能来自其他机器或其他 Windows 账户），请重填后保存';
+        text = '本机已存的 Key 无法解密（可能来自其他机器或另一个系统账户），请重填后保存';
         state = 'error';
     } else if (hasReusableKey()) {
         text = `本机已保存 ${keyMatch.api_key_masked || ''} · ${keyMatch.label || keyMatch.endpoint || ''}${suffix}`;
@@ -1633,6 +1644,298 @@ function checkedBiliPages() {
         .filter((value) => Number.isFinite(value));
 }
 
+// ---- 按 UID 拉投稿列表 ----
+// 只读列表，不触发转写。B 站按 IP 限流，所以后端可能只返回一批：
+// 这里把已拿到的渲染出来，用「继续拉取」带 next_page 续传，绝不因为半路被拦清空列表。
+let upListState = { uid: null, mode: 'all', nextPage: null, complete: false, count: 0 };
+
+function setUpListStatus(message, tone) {
+    const status = byId('upStatus');
+    if (!status) return;
+    status.textContent = message || '';
+    status.classList.toggle('error', tone === 'error');
+    status.classList.toggle('warn', tone === 'warn');
+}
+
+const UP_MODE_LABELS = {
+    all: '拉取全部',
+    recent: '拉取最近 N 个',
+};
+
+function toggleUpLimitField() {
+    const field = byId('upLimitField');
+    const mode = byId('upMode');
+    if (field && mode) field.hidden = mode.value !== 'recent';
+    const button = byId('upFetchBtn');
+    if (button && mode) button.textContent = UP_MODE_LABELS[mode.value] || '拉取列表';
+}
+
+function appendUpVideoRow(video) {
+    const list = byId('upList');
+    const item = document.createElement('label');
+    item.className = 'bili-page-item up-video-item';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = video.url;
+    checkbox.checked = true;
+    const name = document.createElement('span');
+    name.className = 'bili-page-name';
+    // 没有标题（yt-dlp 降级路线）时 BV 号是唯一能认出视频的东西
+    name.textContent = video.title ? video.title : video.bvid;
+    name.title = video.title ? `${video.title}（${video.bvid}）` : video.bvid;
+    item.append(checkbox, name);
+    const meta = video.upload_date || video.duration;
+    if (meta) {
+        const tail = document.createElement('span');
+        tail.className = 'bili-page-duration';
+        tail.textContent = meta;
+        item.append(tail);
+    }
+    list.append(item);
+}
+
+function renderUpList(payload, resume) {
+    const list = byId('upList');
+    if (!list) return;
+    const videos = Array.isArray(payload.videos) ? payload.videos : [];
+    if (!resume) list.innerHTML = '';
+    videos.forEach(appendUpVideoRow);
+
+    upListState = {
+        uid: payload.uid,
+        mode: byId('upMode') ? byId('upMode').value : 'all',
+        nextPage: payload.next_page || null,
+        complete: Boolean(payload.complete),
+        count: list.querySelectorAll('input[type="checkbox"]').length,
+    };
+
+    byId('upAllBtn').hidden = upListState.count === 0;
+    byId('upNoneBtn').hidden = upListState.count === 0;
+    byId('upCopyBtn').hidden = upListState.count === 0;
+    byId('upMoreBtn').hidden = !upListState.nextPage;
+
+    const message = payload.message || '';
+    if (payload.source === 'yt_dlp') {
+        setUpListStatus(message, 'warn');
+    } else if (message && !payload.complete) {
+        setUpListStatus(message, 'warn');
+    } else {
+        setUpListStatus(message, '');
+    }
+    if (payload.cached_count !== null && payload.cached_count !== undefined) {
+        // 本地缓存状态常驻一行，用户不用猜"现在看到的是不是最新的"
+        const cached = `本地已存 ${payload.cached_count} 条`
+            + (payload.cached_updated_at ? `（${String(payload.cached_updated_at).slice(0, 10)} 更新）` : '');
+        byId('upHint').textContent = payload.added
+            ? `${cached} · 本次新增 ${payload.added} 条`
+            : cached;
+    }
+    updateUpSummary();
+}
+
+function updateUpSummary() {
+    const summary = byId('upSummary');
+    if (!summary) return;
+    const list = byId('upList');
+    const rows = list ? list.querySelectorAll('input[type="checkbox"]') : [];
+    const selected = list ? list.querySelectorAll('input[type="checkbox"]:checked') : [];
+    const transcribeButton = byId('upTranscribeBtn');
+    if (!rows.length) {
+        summary.textContent = '还没有拉到视频';
+        if (transcribeButton) transcribeButton.hidden = true;
+        return;
+    }
+    summary.textContent = `共 ${rows.length} 条 · 已选 ${selected.length} 条`
+        + (upListState.nextPage ? '（还有后续）' : '');
+    // 选中项变了按钮要跟着显隐，否则拉完列表却看不到"一键转写"的入口
+    if (transcribeButton) {
+        transcribeButton.hidden = selected.length === 0;
+        transcribeButton.textContent = `逐个转写选中（${selected.length}）`;
+    }
+}
+
+function setUpSelection(mode) {
+    const list = byId('upList');
+    if (!list) return;
+    list.querySelectorAll('input[type="checkbox"]').forEach((box) => {
+        box.checked = mode === 'all';
+    });
+    updateUpSummary();
+}
+
+function copySelectedUpUrls() {
+    const list = byId('upList');
+    if (!list) return;
+    const urls = Array.from(list.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((box) => box.value)
+        .filter(Boolean);
+    if (!urls.length) {
+        showToast('没有勾选任何视频', 'warn');
+        return;
+    }
+    copyTextToClipboard(urls.join('\n'), `已复制 ${urls.length} 条链接`);
+}
+
+async function fetchUpVideos(resume) {
+    const input = byId('upUid');
+    const uid = parseInt((input && input.value ? input.value : '').trim(), 10);
+    if (!Number.isFinite(uid) || uid <= 0) {
+        setUpListStatus('请先填写 UP 主 UID（space.bilibili.com/ 后面那串数字）', 'error');
+        return;
+    }
+    const mode = byId('upMode').value;
+    const limit = parseInt(byId('upLimit').value, 10) || 20;
+    const startPage = resume && upListState.nextPage ? upListState.nextPage : 1;
+    const fetchButton = byId('upFetchBtn');
+    const moreButton = byId('upMoreBtn');
+    fetchButton.disabled = true;
+    moreButton.disabled = true;
+    setUpListStatus('正在拉取：B 站页间有延迟，一次请求可能要几十秒…', '');
+
+    try {
+        const response = await fetch(`${API_BASE}/bili-space-videos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                uid,
+                mode,
+                limit: mode === 'recent' ? limit : null,
+                start_page: startPage,
+            }),
+        });
+        const payload = await readResponse(response, '拉取投稿列表失败');
+        renderUpList(payload, resume);
+    } catch (error) {
+        setUpListStatus(error.message || '拉取投稿列表失败', 'error');
+    } finally {
+        fetchButton.disabled = false;
+        moreButton.disabled = false;
+    }
+}
+
+async function crawlSpacePage() {
+    // 与上面的 UID 路线并列：那条直连接口，这条开真实浏览器渲染页面。
+    // 页面数据请求偶发失败时会重开页面重试，所以这里给的等待提示要说清楚要开窗口。
+    const input = byId('upSpaceUrl');
+    const value = ((input && input.value) || '').trim();
+    if (!value) {
+        setUpListStatus('请先粘贴空间链接，形如 space.bilibili.com/123456/upload/video', 'error');
+        return;
+    }
+    const button = byId('upCrawlBtn');
+    button.disabled = true;
+    setUpListStatus('正在用浏览器打开空间页面并滚动加载（会弹出浏览器窗口，可能要几十秒）…', '');
+    try {
+        const response = await fetch(`${API_BASE}/bili-space-crawl`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: value }),
+        });
+        const payload = await readResponse(response, '浏览器抓取失败');
+        renderUpList(payload, false);
+    } catch (error) {
+        setUpListStatus(error.message || '浏览器抓取失败', 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function openDirectory(taskId) {
+    // 只传任务 ID 或空：后端不接受任意路径，避免这个端点变成"打开任意目录"的入口
+    try {
+        const response = await fetch(`${API_BASE}/open-directory`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(taskId ? { task_id: taskId } : {}),
+        });
+        const data = await readResponse(response, '打开目录失败');
+        if (data.opened) {
+            showToast(`已在文件管理器中打开：${data.path}`, 'success');
+        } else {
+            window.prompt('未能自动打开文件管理器，请手动前往：', data.path);
+        }
+    } catch (error) {
+        showToast(error.message || '打开目录失败', 'error');
+    }
+}
+
+async function transcribeSelectedUpVideos() {
+    const list = byId('upList');
+    if (!list) return;
+    const urls = Array.from(list.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((box) => box.value)
+        .filter((value) => /^https?:\/\//.test(value || ''));
+    if (!urls.length) {
+        showToast('没有勾选任何视频', 'warn');
+        return;
+    }
+
+    // 首次用所选 Whisper 模型时先确认下载体积（批量提交会反复用到它）
+    const whisperOption = byId('whisperModel').selectedOptions[0];
+    if (whisperOption) {
+        const status = whisperOption.dataset.status || '';
+        const modelId = whisperOption.value;
+        if (status && status !== 'cached' && modelId && !whisperDownloadConfirmed(modelId)) {
+            const modelLabel = (whisperOption.dataset.baseLabel || whisperOption.textContent).split('（')[0];
+            const size = WHISPER_MODEL_SIZES[modelId] || '';
+            if (!window.confirm(`所选模型「${modelLabel}」尚未缓存，首次转写需下载约 ${size}。\n继续提交这 ${urls.length} 个任务？`)) {
+                showToast('已取消，未提交任何任务', 'info');
+                return;
+            }
+            rememberWhisperDownloadConfirm(modelId);
+        }
+    }
+
+    const warning = urls.length > 50
+        ? `\n\n注意：共 ${urls.length} 个，后端一次只跑 1 个（其余排队），全部跑完会花很长时间；任务历史最多显示 100 条，更早的仍保留在磁盘上。`
+        : '';
+    if (!window.confirm(`将逐个提交 ${urls.length} 个转写任务（仅转录，不需要 API Key），后端排队逐个执行。继续？${warning}`)) {
+        showToast('已取消，未提交任何任务', 'info');
+        return;
+    }
+
+    const button = byId('upTranscribeBtn');
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    let submitted = 0;
+    const failures = [];
+
+    try {
+        for (const [index, url] of urls.entries()) {
+            button.textContent = `提交中 ${index + 1}/${urls.length}`;
+            try {
+                const config = buildSummarizeConfig(url, null, null, true, true, {
+                    ignoreBiliPages: true,
+                });
+                const response = await fetch(`${API_BASE}/summarize`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config),
+                });
+                const data = await readResponse(response, '提交任务失败');
+                if (!data.task_id) throw new Error('后端未返回任务 ID');
+                submitted += 1;
+            } catch (error) {
+                failures.push(`${url}：${error.message}`);
+            }
+        }
+    } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+    }
+
+    if (failures.length) {
+        console.warn('[VideoToNo] 批量转写提交失败：', failures);
+        showToast(
+            `已提交 ${submitted} 个，失败 ${failures.length} 个${submitted ? '，可去「最近任务」查看' : ''}`,
+            submitted ? 'warn' : 'error'
+        );
+    } else {
+        showToast(`已提交 ${submitted} 个转写任务，后端排队逐个执行`, 'success');
+    }
+    loadRecentTasks(true);
+}
+
 function urlPageParam(url) {
     try {
         const value = parseInt(new URL(url).searchParams.get('p'), 10);
@@ -2032,6 +2335,8 @@ async function startSummary(options = {}) {
 
         if (!data.task_id) throw new Error('后端未返回任务 ID');
         currentTaskId = data.task_id;
+        // 任务目录在提交那一刻就建好了，不用等跑完才能打开
+        byId('openTaskFolderBtn').disabled = false;
         setTranscriptTaskView(request.transcriptOnly);
         loadRecentTasks(true);
         if (data.reused_task_id) addLog(`已复用任务 ${data.reused_task_id} 的中间结果`, 'success');
@@ -2108,7 +2413,8 @@ function validationError(message) {
 }
 
 function buildSummarizeConfig(
-    videoUrl, uploadTaskId, resumeTaskId = null, forceRestart = false, transcriptOnly = false
+    videoUrl, uploadTaskId, resumeTaskId = null, forceRestart = false, transcriptOnly = false,
+    options = {}
 ) {
     const config = {
         video_url: videoUrl,
@@ -2117,8 +2423,9 @@ function buildSummarizeConfig(
         use_gpu: byId('useGpu').checked,
         processing_mode: forceRestart ? 'restart' : 'reuse'
     };
-    // 分 P 面板可见时显式下发勾选页码（全选也下发：显式指定优先于 URL ?p=N 规则）
-    if (videoUrl && biliPagesPanelVisible()) {
+    // 分 P 面板可见时显式下发勾选页码（全选也下发：显式指定优先于 URL ?p=N 规则）。
+    // 批量转写要传 ignoreBiliPages：那时面板里的勾选属于**另一个视频**，带上去就错了。
+    if (videoUrl && biliPagesPanelVisible() && !options.ignoreBiliPages) {
         const pages = checkedBiliPages();
         if (pages.length) config.bilibili_pages = pages;
     }
@@ -2288,6 +2595,7 @@ function resetTaskView() {
     byId('downloadMdBtn').disabled = true;
     byId('copyNoteBtn').disabled = true;
     byId('regenerateBtn').disabled = true;
+    byId('openTaskFolderBtn').disabled = true;
     byId('outputNotice').hidden = true;
     byId('outputPath').textContent = '';
     renderTaskAdvisory(null);

@@ -336,7 +336,11 @@ def test_llm_key_endpoints_roundtrip(monkeypatch, tmp_path) -> None:
     empty = client.get("/api/llm-keys")
     assert empty.status_code == 200
     assert empty.json()["entries"] == []
-    assert empty.json()["storage"]["algorithm"] in {secret_box.ALG_DPAPI, secret_box.ALG_PLAIN}
+    assert empty.json()["storage"]["algorithm"] in {
+        secret_box.ALG_DPAPI,
+        secret_box.ALG_KEYCHAIN,
+        secret_box.ALG_PLAIN,
+    }
 
     saved = client.put(
         "/api/llm-keys",

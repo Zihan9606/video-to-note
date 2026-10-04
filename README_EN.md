@@ -10,7 +10,7 @@
 
 <p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="Latest release"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
 
-<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ Download the Windows portable build</strong></a></p>
+<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ Download the Windows portable build / macOS build</strong></a></p>
 
 <p align="center">🎬 Promo video (Bilibili): <a href="https://www.bilibili.com/video/BV1Qwby6DEu1/">https://www.bilibili.com/video/BV1Qwby6DEu1/</a> &nbsp;·&nbsp; 👥 QQ group: <code>739200648</code></p>
 
@@ -61,14 +61,14 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 ## 🚀 Portable build (recommended)
 
-No Python or development setup is required. Download `VideoToNo-1.4.2-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
+No Python or development setup is required. Download `VideoToNo-1.4.2-portable.exe` (Windows) or `VideoToNo-1.4.2-macos.zip` (Apple Silicon Mac) from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
 
-1. Download and double-click the exe;
+1. Windows: download and double-click the exe. macOS: unzip and double-click `VideoToNo.app` — a build downloaded from the internet is stopped by Gatekeeper, so choose "Open Anyway" in **System Settings → Privacy & Security**, or run `xattr -dr com.apple.quarantine VideoToNo.app` in a terminal;
 2. Wait for the local page to open in your browser;
 3. Paste a video URL or upload a local file — for a finished note, enter a provider, model, and API key first; **for a timestamped transcript only, choose "Transcript only" and enter nothing**;
 4. Generate and review the note or the transcript.
 
-The portable build starts the local service and stays in the system tray. The first Whisper transcription downloads a model, so keep the network available. Tasks, transcripts, screenshots, and notes are stored under `workspace/` next to the exe by default.
+The portable build starts the local service and stays in the system tray (the taskbar on Windows, the menu bar on macOS — quit from there). The first Whisper transcription downloads a model, so keep the network available. Tasks, transcripts, screenshots, and notes are stored under `workspace/` next to the app by default; when the app sits in a non-writable folder such as `/Applications`, they go to `~/Library/Application Support/VideoToNo/workspace/` instead.
 
 ## ✨ Highlights
 
@@ -79,6 +79,10 @@ The portable build starts the local service and stays in the system tray. The fi
 - 🧠 **Long-transcript handling**: chunks, summarizes, and reduces long material while keeping context pressure under control.
 - 🖼️ **Multiple exports**: Markdown, HTML, JSON, plain text, and PNG, with optional video screenshots as note attachments.
 - 🤖 **Raw material for agents**: a connected agent can stop at the timestamped transcript — no LLM call and no API key for this machine, and it writes the notes in its own structure and style.
+- 📋 **Fetch a whole channel by UID**: enter a creator's UID to get their video addresses — **just two options, "All videos" and "Recent N", sharing one incremental store**: addresses live in your local `workspace/up_lists/<uid>.json`, and after the first full pull each call only fetches as far as the first video already stored, so it stops tripping Bilibili's rate limit.
+- 🕷️ **Browser crawl (more reliable, and incremental too)**: paste a space link (e.g. `space.bilibili.com/123456/upload/video`) and Playwright drives a real Chromium to load the page, **click through the pagination** and intercept the page's own API responses — the fullest field set (title + exact publish time), measured 185/185 in one run. **It is incremental as well**: once the local copy is complete it only checks page 1 for new videos, and when pages were blocked before it goes straight to those pages — they are recorded in the cache instead of re-clicking all five pages.
+- ▶️ **Tick and transcribe**: once the list is ticked, press "Transcribe selected (N)" — no copying links elsewhere. The backend queues them one at a time per `MAX_CONCURRENT_TASKS` (transcript only, no API key) and you watch progress under *Recent tasks*.
+- 📂 **Open the files**: "Open transcript folder" in the sidebar locates every output, and "Open containing folder" on the result panel goes straight to that task's directory (it only accepts a local task ID, never an arbitrary path).
 - 🛡️ **Local-first**: media downloads, transcription, and file generation happen locally; the service listens on `127.0.0.1` by default.
 
 ## 🔁 Processing pipeline
@@ -109,15 +113,17 @@ After starting the app:
 1. Choose the output type: **Note** (needs an API key) or **Transcript only** (a timestamped transcript and nothing else — no LLM is called, **no API key needed**, and the note-style and screenshot settings collapse);
 2. For notes, pick a model profile and enter an API key: DeepSeek / OpenAI / GLM / Qwen / Kimi each remember their own model, and custom OpenAI-compatible endpoints can be saved as several named profiles — switching profiles never overwrites another one's settings;
 3. Choose a note style, reasoning effort, and Whisper model;
-4. Paste a video URL or upload a local file;
+4. Paste a video URL or upload a local file; to batch-process one creator, open **Fetch uploads by UID**, enter the UID and pull addresses (**read-only — nothing starts transcribing**), then tick and copy the links — both **All videos** and **Recent N** keep the local copy up to date, so the first call is expensive and every later one only fetches what is new; **if the API keeps getting rate-limited, use Browser crawl on the line below**: paste the space link and it opens a browser to click through the pages;
 5. Preview, copy, or download the result. A transcript stays in *Recent tasks* (tagged *Transcript*) for later review and download, and "Write notes from this transcript" switches it to the note route without re-running the transcription.
 
-Profiles, recognition settings and the theme are non-sensitive and are remembered automatically in your local browser. An API key stays in the current page only, and is lost on refresh until you press **Save to this machine**; that writes it to `workspace/llm_keys.json`, encrypted with Windows' built-in DPAPI (a copy of the file on another machine or Windows account cannot be decrypted) — other platforms store it in plaintext and the interface says so. **A saved key is bound to its endpoint address**: it is only reused when the target address matches, never sent to another gateway. QR-login Bilibili cookies still live only in the local process unless you explicitly save them; do not share those workspace files.
+Profiles, recognition settings and the theme are non-sensitive and are remembered automatically in your local browser. An API key stays in the current page only, and is lost on refresh until you press **Save to this machine**; that writes it to `workspace/llm_keys.json`, encrypted with Windows' built-in DPAPI or, on macOS, with a master key held in the system Keychain (a copy of the file on another machine or user account cannot be decrypted) — platforms with neither store it in plaintext and the interface says so. **A saved key is bound to its endpoint address**: it is only reused when the target address matches, never sent to another gateway. QR-login Bilibili cookies still live only in the local process unless you explicitly save them; do not share those workspace files.
 
 <details>
 <summary>🧑‍💻 Source use and building (developers)</summary>
 
-If you want the source, use `git clone` or GitHub **Code → Download ZIP**. The project targets Windows + Python 3.11; install `backend/requirements.txt` and use `start.ps1` to run it:
+If you want the source, use `git clone` or GitHub **Code → Download ZIP**. The project targets Windows / macOS + Python 3.11; install `backend/requirements.txt` and start it with the script for your platform.
+
+Windows:
 
 ```powershell
 git clone https://github.com/like-attract/video-to-note.git
@@ -126,10 +132,28 @@ cd video-to-note
 .\start.ps1
 ```
 
+macOS (Linux works the same way):
+
+```bash
+git clone https://github.com/like-attract/video-to-note.git
+cd video-to-note
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt
+./start.sh
+```
+
+`start.sh` takes the same flags as `start.ps1` (`--foreground` / `--restart` / `--no-browser` / `--bind-host` / `--port`), and so do the paired `stop.sh` (`--quiet` / `--all`) and `restart.sh`; logs and the state file stay in `.runtime/`. If a virtual environment built from a python.org installer reports `certificate verify failed`, run `./.venv/bin/python "Install Certificates.command"` or `export SSL_CERT_FILE=/etc/ssl/cert.pem` first — otherwise `yt-dlp` and model downloads fail.
+
 Build a Windows portable executable with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+```
+
+Build the macOS app bundle (produces `dist/VideoToNo.app`):
+
+```bash
+./scripts/build_app.sh
 ```
 
 </details>
@@ -160,10 +184,12 @@ Available tools:
 | `transcribe_video` | Stop at the timestamped transcript: no LLM call anywhere in this route, so no API key is needed |
 | `get_transcript` | Fetch a task's transcript (full markdown or JSON segments); works for historical tasks whose note generation later failed |
 | `wait_for_task` | Wait for a terminal task state for up to 45 seconds per call — use it instead of aggressive polling. Note tasks return the finished note; transcript-only tasks return status plus a pointer to `get_transcript` |
+| `list_up_videos` | Pull a creator's video addresses by UID. Only two values: `mode="all"` (everything) and `mode="recent"` (newest N), **both sharing one incremental store** — it pulls as needed when the local copy is empty, resumes from where a previous batch stopped when it is incomplete, and otherwise stops at the first video already stored (usually one or two requests). `added` is what this call brought in, `cached_count` is the local total; Bilibili rate-limits per IP, so check `complete` |
+| `crawl_space_page` | **Browser crawl**: opens the space link with Playwright, clicks through the pagination and intercepts the page's own API responses to get every address with title and publish time. Use it when the API route is rate-limited; it does open a Chromium window. First run needs `.venv/bin/python -m playwright install chromium` |
 | `get_task_status` | Inspect intermediate task progress |
 | `list_whisper_models` | Show local Whisper model cache status |
-| `save_llm_config` | Save the provider, model, and API key for one endpoint address locally (encrypted on Windows, plaintext with a visible note elsewhere) so calls to that address need no key |
-| `save_bilibili_credentials` | Save Bilibili credentials such as SESSDATA for automatic use with Bilibili videos, sealed with the same local encryption as API keys (encrypted on Windows, plaintext with a visible note elsewhere) |
+| `save_llm_config` | Save the provider, model, and API key for one endpoint address locally (DPAPI on Windows, Keychain on macOS, plaintext with a visible note elsewhere) so calls to that address need no key |
+| `save_bilibili_credentials` | Save Bilibili credentials such as SESSDATA for automatic use with Bilibili videos, sealed with the same local encryption as API keys (DPAPI on Windows, Keychain on macOS, plaintext with a visible note elsewhere) |
 | `list_llm_keys` | List the endpoint addresses whose keys are saved locally (masked values and storage algorithm only) |
 | `get_saved_config` | View saved configuration status with secrets masked |
 
@@ -207,7 +233,7 @@ codex mcp add local videotono -- python -m backend.mcp_server
 
 The MCP server automatically scans ports 8000–8019 to locate a running VideoToNo service. Set `VIDEOTONOTES_BACKEND_URL` to explicitly choose the backend URL.
 
-> Privacy: `save_llm_config` (and the web page's **Save to this machine**) writes API keys to `workspace/llm_keys.json`, encrypted per Windows user with the system DPAPI — copying that file to another machine or another Windows account makes it undecryptable and you must re-enter the key. Non-Windows platforms have no DPAPI, so keys are stored in plaintext and the interface says so. A stored key is bound to the endpoint address it was saved for and is only reused when that address matches. `save_bilibili_credentials` seals SESSDATA and bili_jct with the same envelope into `workspace/bili_credentials.json` (also bound to the current Windows account, so re-save it after moving machines; `buvid3` is a device identifier the client already sends in the clear, so it stays plaintext). Nothing is persisted unless you explicitly call a save tool; `workspace/` is excluded by `.gitignore` and is not committed to this repository — do not share those files.
+> Privacy: `save_llm_config` (and the web page's **Save to this machine**) writes API keys to `workspace/llm_keys.json`, encrypted per user with the system DPAPI on Windows; on macOS a master key lives in the Keychain and only ciphertext is written to the file — copying that file to another machine or user account makes it undecryptable and you must re-enter the key. Platforms with neither keystore fall back to plaintext and the interface says so. A stored key is bound to the endpoint address it was saved for and is only reused when that address matches. `save_bilibili_credentials` seals SESSDATA and bili_jct with the same envelope into `workspace/bili_credentials.json` (also bound to the current system account, so re-save it after moving machines; `buvid3` is a device identifier the client already sends in the clear, so it stays plaintext). Nothing is persisted unless you explicitly call a save tool; `workspace/` is excluded by `.gitignore` and is not committed to this repository — do not share those files.
 
 </details>
 
@@ -269,6 +295,41 @@ Downloads and cached files are verified for integrity; corrupt leftovers from in
 ### Why is CPU transcription slower than the video duration?
 
 Speed depends on CPU performance, media duration, and model size. CPU mode uses `int8` to reduce resource pressure, but `medium`, `large-v3`, and `turbo` can still be slow and memory-intensive. Start with `base` on a personal computer, and enable GPU mode only after confirming CUDA works correctly.
+
+### Why does clicking "Import via QR login" on macOS ask for authorization?
+
+A Mac without Chrome / Edge falls back to Safari. Safari does not speak Chrome's debugging
+protocol, so reading its cookies goes through the official `safaridriver`, which needs a
+one-time authorization:
+
+1. Safari → Settings → Advanced → check "Show features for web developers" (Show Develop menu);
+2. Develop menu → Allow Remote Automation (same as `sudo safaridriver --enable` in a terminal);
+3. Click "Import via QR login" again.
+
+The authorization sticks. Note that Safari uses your **real browser profile** (unlike Chrome,
+which gets an isolated one) — the upside is that an existing sign-in is picked up immediately.
+With Chrome or Edge installed they are preferred and need no authorization at all.
+
+### Fetching a creator's list reports rate limiting (412 / -352 / -403)?
+
+Bilibili rate-limits its space archive API by **IP + sign-in state**; paging continuously will
+trip it and the block needs time to cool down. Mitigations, in the order you should use them:
+
+1. **Rely on the incremental store instead of re-pulling everything**: both options (all videos /
+   recent N) share one `workspace/up_lists/<uid>.json` — after the first full pull each call stops
+   at the first video already stored, so it usually costs **one request**. An unfinished batch
+   resumes where it stopped rather than restarting at page 1.
+2. **Import credentials via QR login**: signed-in requests are treated far more leniently — the
+   single biggest win.
+3. **The puller already has guardrails**: forced inter-page delay, exponential backoff, and a
+   **partial result on failure** with `next_page` to continue — data is never thrown away.
+4. **Different IP (optional, needs your own proxy)**: these requests honour the standard proxy
+   environment variables, so `HTTPS_PROXY=http://127.0.0.1:7890 ./start.sh` routes them through your
+   proxy; the `yt-dlp` fallback honours it too. Note Bilibili is *more* suspicious of datacenter
+   IPs — residential proxies are what actually help. This project neither provides nor brokers any
+   third-party IP source.
+
+The block is temporary: wait a bit and retry, and nothing already fetched is lost.
 
 ### Why would I need a Bilibili cookie?
 

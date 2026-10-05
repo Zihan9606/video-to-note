@@ -117,7 +117,7 @@ def _dispatch(script: Path, args: list[str]) -> int:
 
 def _read_state() -> dict:
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
 

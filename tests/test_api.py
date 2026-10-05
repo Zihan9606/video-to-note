@@ -5,6 +5,7 @@ import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1559,6 +1560,7 @@ def test_upload_large_video_auto_extracts_audio(
 ) -> None:
     monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
     monkeypatch.setattr(main, "LARGE_UPLOAD_EXTRACT_BYTES", 1)
+    monkeypatch.setattr(main, "tasks", {})
 
     def fake_extract(source, target):
         target.write_bytes(b"_audio_stream_")
@@ -1587,6 +1589,7 @@ def test_upload_keeps_video_when_screenshots_requested(
 ) -> None:
     monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
     monkeypatch.setattr(main, "LARGE_UPLOAD_EXTRACT_BYTES", 1)
+    monkeypatch.setattr(main, "tasks", {})
     called = {"extract": False}
 
     def fake_extract(source, target):
@@ -2519,3 +2522,102 @@ async def test_write_per_page_transcripts_single_page_writes_nothing(
 
     assert written == 0
     assert list((tmp_path / task_id).glob("transcript_p*.md")) == []
+
+
+def test_sanitize_task_stem_strips_unsafe_characters() -> None:
+    """目录名片段：非法字符变下划线、控制符去掉、保留名加前缀、超长截断。"""
+    assert main.sanitize_task_stem('a<b>c:d"e/f\\g|h?i*j') == "a_b_c_d_e_f_g_h_i_j"
+    assert main.sanitize_task_stem("  ..  ") == ""
+    assert main.sanitize_task_stem("CON") == "_CON"
+    assert len(main.sanitize_task_stem("很长的标题" * 30)) <= main.TASK_STEM_MAX_LENGTH
+    # 中文标点不在 Windows 非法字符集里，原样保留
+    assert main.sanitize_task_stem("课程《进阶》：下") == "课程《进阶》：下"
+
+
+def test_make_task_id_names_folder_after_title_and_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """任务目录 = 「视频名_yyyymmdd」；同名同天再提交加序号。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    today = time.strftime("%Y%m%d")
+
+    first = main.make_task_id("C++ 从入门到精通/实战", "")
+    assert first == f"C++_从入门到精通_实战_{today}"
+    (tmp_path / first).mkdir()
+    assert main.make_task_id("C++ 从入门到精通/实战", "") == f"{first}_2"
+
+
+def test_make_task_id_falls_back_to_bvid_then_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没带标题时取链接里的 BV/av 号，都没有才落到 video；标题始终优先。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    # tasks 也要隔离：make_task_id 会拿它查同名占用，别被别的测试留下的键干扰
+    monkeypatch.setattr(main, "tasks", {})
+    today = time.strftime("%Y%m%d")
+
+    assert (
+        main.make_task_id("", "https://www.bilibili.com/video/BV1abCdEfGh1?p=2")
+        == f"BV1abCdEfGh1_{today}"
+    )
+    assert main.make_task_id("", "https://www.douyin.com/video/123456") == f"video_{today}"
+    assert (
+        main.make_task_id("标题优先", "https://www.bilibili.com/video/BV1abCdEfGh1")
+        == f"标题优先_{today}"
+    )
+
+
+def test_summarize_submission_names_task_folder_after_title(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """提交带 title：任务目录按标题命名，中文 task_id 走编码后的 API 路径可读。"""
+    async def fake_run(task_id, request):
+        return None
+
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "run_queued_video_task", fake_run)
+    monkeypatch.setattr(main, "tasks", {})
+    monkeypatch.setattr(main, "running_jobs", {})
+    client = TestClient(main.app)
+    today = time.strftime("%Y%m%d")
+
+    response = client.post(
+        "/api/summarize",
+        json={
+            "video_url": "https://www.bilibili.com/video/BV1abCdEfGh1",
+            "title": "80节课合集 第一讲",
+            "llm_config": {"model_type": "deepseek", "api_key": "test-key"},
+        },
+    )
+
+    assert response.status_code == 200
+    task_id = response.json()["task_id"]
+    assert task_id == f"80节课合集_第一讲_{today}"
+    assert (tmp_path / task_id).is_dir()
+    detail = client.get(f"/api/task/{quote(task_id, safe='')}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "pending"
+
+
+def test_upload_names_task_folder_after_filename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """本地上传：目录用文件名（去掉扩展名）+ 日期命名，转写复用该目录。"""
+    async def fake_run(task_id, request):
+        return None
+
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "run_queued_video_task", fake_run)
+    monkeypatch.setattr(main, "tasks", {})
+    monkeypatch.setattr(main, "running_jobs", {})
+    client = TestClient(main.app)
+    today = time.strftime("%Y%m%d")
+
+    response = client.post(
+        "/api/upload", files={"file": ("高等数学 第3讲.mp4", b"bits", "video/mp4")}
+    )
+
+    assert response.status_code == 200
+    task_id = response.json()["task_id"]
+    assert task_id == f"高等数学_第3讲_{today}"
+    assert (tmp_path / task_id).is_dir()

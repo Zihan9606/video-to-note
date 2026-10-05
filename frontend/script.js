@@ -1862,9 +1862,15 @@ async function openDirectory(taskId) {
 async function transcribeSelectedUpVideos() {
     const list = byId('upList');
     if (!list) return;
-    const urls = Array.from(list.querySelectorAll('input[type="checkbox"]:checked'))
-        .map((box) => box.value)
-        .filter((value) => /^https?:\/\//.test(value || ''));
+    const entries = Array.from(list.querySelectorAll('input[type="checkbox"]:checked'))
+        .map((box) => {
+            const name = box.parentElement
+                ? box.parentElement.querySelector('.bili-page-name')
+                : null;
+            return { url: box.value, title: name ? name.textContent.trim() : '' };
+        })
+        .filter((entry) => /^https?:\/\//.test(entry.url || ''));
+    const urls = entries.map((entry) => entry.url);
     if (!urls.length) {
         showToast('没有勾选任何视频', 'warn');
         return;
@@ -1901,11 +1907,12 @@ async function transcribeSelectedUpVideos() {
     const failures = [];
 
     try {
-        for (const [index, url] of urls.entries()) {
-            button.textContent = `提交中 ${index + 1}/${urls.length}`;
+        for (const [index, entry] of entries.entries()) {
+            button.textContent = `提交中 ${index + 1}/${entries.length}`;
             try {
-                const config = buildSummarizeConfig(url, null, null, true, true, {
+                const config = buildSummarizeConfig(entry.url, null, null, true, true, {
                     ignoreBiliPages: true,
+                    title: entry.title,
                 });
                 const response = await fetch(`${API_BASE}/summarize`, {
                     method: 'POST',
@@ -1916,7 +1923,7 @@ async function transcribeSelectedUpVideos() {
                 if (!data.task_id) throw new Error('后端未返回任务 ID');
                 submitted += 1;
             } catch (error) {
-                failures.push(`${url}：${error.message}`);
+                failures.push(`${entry.url}：${error.message}`);
             }
         }
     } finally {
@@ -2423,6 +2430,14 @@ function buildSummarizeConfig(
         use_gpu: byId('useGpu').checked,
         processing_mode: forceRestart ? 'restart' : 'reuse'
     };
+    // 任务目录按「标题_日期」命名：优先调用方显式传入（批量转写从列表项取），
+    // 否则用分 P 预览缓存里该链接的标题（提交前的自动预览基本都命中）
+    const previewTitle = options.title || (
+        videoUrl && !options.ignoreBiliPages
+            ? (biliPagesCache.get(normalizeVideoInput(videoUrl)) || {}).title
+            : ''
+    );
+    if (previewTitle) config.title = String(previewTitle).trim();
     // 分 P 面板可见时显式下发勾选页码（全选也下发：显式指定优先于 URL ?p=N 规则）。
     // 批量转写要传 ignoreBiliPages：那时面板里的勾选属于**另一个视频**，带上去就错了。
     if (videoUrl && biliPagesPanelVisible() && !options.ignoreBiliPages) {

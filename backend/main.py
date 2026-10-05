@@ -12,7 +12,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -384,6 +383,9 @@ class LLMConfig(BaseModel):
 
 class SummarizeRequest(BaseModel):
     video_url: str = ""
+    # 提交时已知的视频标题（前端预览/抓取列表/上传文件名）：任务目录按
+    # 「标题_yyyymmdd」命名；不给就从链接里取 BV/av 号，再不行用 video
+    title: str = ""
     upload_task_id: str | None = None
     resume_task_id: str | None = None
     processing_mode: Literal["reuse", "restart"] = "reuse"
@@ -407,6 +409,7 @@ class TranscribeRequest(BaseModel):
     """`POST /api/transcribe` 的请求体：刻意没有任何大模型字段。"""
 
     video_url: str = ""
+    title: str = ""
     upload_task_id: str | None = None
     resume_task_id: str | None = None
     processing_mode: Literal["reuse", "restart"] = "reuse"
@@ -489,6 +492,54 @@ def task_directory(task_id: str) -> Path:
     candidate = (WORKSPACE_DIR / task_id).resolve()
     if candidate.parent != WORKSPACE_DIR:
         raise ValueError("非法任务 ID")
+    return candidate
+
+
+# Windows 保留设备名：目录名撞上它们会让 mkdir 直接失败
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+TASK_STEM_MAX_LENGTH = 50
+
+
+def sanitize_task_stem(value: str) -> str:
+    """把标题 / 文件名压成安全的目录名片段。
+
+    替换文件系统非法字符与控制符、空白归一为下划线、去掉首尾的点
+    （Windows 不允许结尾点，"." / ".." 更不能当目录名），并截断到
+    TASK_STEM_MAX_LENGTH——标题可以很长，路径总长不能失控。
+    """
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", str(value or ""))
+    cleaned = re.sub(r"\s+", "_", cleaned.strip())
+    cleaned = cleaned[:TASK_STEM_MAX_LENGTH].strip("._")
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def make_task_id(title_hint: str = "", url_hint: str = "") -> str:
+    """任务 ID 兼作任务目录名：「视频名_yyyymmdd」，同名同天加序号。
+
+    定名发生在提交那一刻：task_id 之后不能再变（前端拿它轮询、取消、下载，
+    目录里也按它读写 manifest）。标题由前端随请求带来；没带就从链接里取
+    BV/av 号；再没有才落到 video。历史 uuid 目录不受影响，照常可访问。
+    """
+    stem = sanitize_task_stem(title_hint)
+    if not stem:
+        match = re.search(r"BV[0-9A-Za-z]{10}", str(url_hint or ""), re.I)
+        if match is None:
+            match = re.search(r"av\d+", str(url_hint or ""), re.I)
+        stem = sanitize_task_stem(match.group(0)) if match else ""
+    if not stem:
+        stem = "video"
+    base = f"{stem}_{time.strftime('%Y%m%d')}"
+    candidate = base
+    suffix = 2
+    while (WORKSPACE_DIR / candidate).exists() or candidate in tasks:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
     return candidate
 
 
@@ -797,7 +848,10 @@ async def submit_video_task(
         if not resume_dir.is_dir():
             raise HTTPException(status_code=404, detail="要继续的任务目录不存在")
 
-    task_id = request.upload_task_id or str(uuid.uuid4())
+    title_hint = request.title
+    if not title_hint and reused_task_id:
+        title_hint = str(read_task_manifest(reused_task_id).get("title") or "")
+    task_id = request.upload_task_id or make_task_id(title_hint, request.video_url)
     if uploaded_task is not None:
         tasks[task_id] = new_task(task_id=task_id)
         tasks[task_id]["uploaded_file_path"] = uploaded_task.get("uploaded_file_path")
@@ -1473,7 +1527,7 @@ async def upload_video(
     if suffix not in ALLOWED_MEDIA_SUFFIXES:
         raise HTTPException(status_code=415, detail="不支持的媒体文件类型")
 
-    task_id = str(uuid.uuid4())
+    task_id = make_task_id(Path(filename).stem)
     task_dir = WORKSPACE_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=False)
     file_path = task_dir / f"input{suffix}"

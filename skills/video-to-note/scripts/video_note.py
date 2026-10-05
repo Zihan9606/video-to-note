@@ -31,6 +31,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 import uuid
 from pathlib import Path
 
@@ -163,7 +164,8 @@ def poll_task(base: str, task_id: str, wait_seconds: int) -> dict:
     deadline = time.monotonic() + wait_seconds
     printed_logs = 0
     while True:
-        task = http_json("GET", f"{base}/api/task/{task_id}", timeout=15)
+        # task_id 现在是「视频名_日期」，含中文；urllib 不会替非 ASCII 路径编码
+        task = http_json("GET", f"{base}/api/task/{quote(task_id, safe='')}", timeout=15)
         logs = task.get("logs") or []
         for line in logs[printed_logs:]:
             print(f"  | {redact(line)}")
@@ -348,7 +350,7 @@ def main() -> None:
     if transcript_only:
         transcript = http_json(
             "GET",
-            f"{base}/api/task/{task_id}/transcript?output_format=markdown",
+            f"{base}/api/task/{quote(task_id, safe='')}/transcript?output_format=markdown",
             timeout=60,
         )
         body = transcript.get("text") or ""

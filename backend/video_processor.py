@@ -188,6 +188,9 @@ def normalize_video_input(value: str) -> str | None:
 
 
 class VideoProcessor:
+    # 逐页检查分 P 字幕的并发路数：再多容易撞 B 站按 IP 的风控，再少又退回
+    # 「进度条一动不动」的老样子（80 页串行实测要一分多钟无反馈）
+    SUBTITLE_SCAN_CONCURRENCY = 3
     # B 站风控要求真实浏览器 UA；yt-dlp 的 bilibili 提取器依赖它通过 /web-interface 接口检查
     BILI_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -325,6 +328,9 @@ class VideoProcessor:
         url: str,
         cookie: dict[str, str] | None = None,
         only_pages: Sequence[int] | None = None,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> BiliSubtitleOutcome:
         """B 站 AI 字幕专属通道（支持多分 P）。
 
@@ -337,6 +343,11 @@ class VideoProcessor:
         处理全部分 P。返回 BiliSubtitleOutcome 而非裸 None：调用方需要
         区分「凭据缺失」、「视频没有字幕」等不同原因，也能知道哪些分 P
         需要语音转写补齐。
+
+        逐页检查按 SUBTITLE_SCAN_CONCURRENCY 路并发执行：80 个分 P 串行
+        要一两分钟且期间毫无动静，用户只看到「查找平台字幕」一动不动。
+        progress(已完成页数, 总页数) 每完成一页回调一次；should_abort
+        置位后不再开新页，已在途的请求跑完即返回，让取消秒级生效。
         """
         video = await self.bilibili_video_pages(url, cookie)
         if video is None:
@@ -363,39 +374,80 @@ class VideoProcessor:
                 pages=tuple(selected),
                 pages_to_transcribe=tuple(selected),
             )
+
+        semaphore = asyncio.Semaphore(self.SUBTITLE_SCAN_CONCURRENCY)
+        scan: dict[int, dict[str, Any]] = {}
+        completed = 0
+        aborted = False
+
+        def aborted_now() -> bool:
+            return aborted or bool(should_abort and should_abort())
+
+        async def scan_page(page: BiliPage) -> None:
+            nonlocal completed, aborted
+            if aborted_now():
+                aborted = True
+                return
+            async with semaphore:
+                if aborted_now():
+                    aborted = True
+                    return
+                record: dict[str, Any] = {"page": page}
+                track = await asyncio.to_thread(
+                    self._bilibili_subtitle_track, video.bvid, video.aid, page.cid, cookie
+                )
+                if not track:
+                    record["kind"] = "no_track"
+                else:
+                    try:
+                        payload = await asyncio.to_thread(
+                            self._download_text,
+                            track["url"],
+                            url,
+                            cookie,
+                            {"Origin": "https://www.bilibili.com"},
+                        )
+                        segments = parse_subtitle_payload(payload, "json")
+                    except Exception as exc:
+                        record["kind"] = "error"
+                        record["error"] = f"{type(exc).__name__}: {exc}"
+                    else:
+                        if segments:
+                            record["kind"] = "subtitle"
+                            record["segments"] = segments
+                            record["language"] = track["language"]
+                        else:
+                            record["kind"] = "empty"
+                scan[page.page] = record
+                completed += 1
+                if progress is not None:
+                    progress(completed, len(selected))
+                if aborted_now():
+                    aborted = True
+
+        await asyncio.gather(*(scan_page(page) for page in selected))
+
+        # 组装阶段按 selected 顺序重放，与原串行版的页序语义一致
         subtitle_by_page: dict[int, SubtitleResult] = {}
         pages_to_transcribe: list[BiliPage] = []
         first_error = ""
         saw_track_without_segments = False
         for page in selected:
-            track = await asyncio.to_thread(
-                self._bilibili_subtitle_track, video.bvid, video.aid, page.cid, cookie
-            )
-            if not track:
-                pages_to_transcribe.append(page)
+            record = scan.get(page.page)
+            if record is None:  # 取消时未开的页
                 continue
-            try:
-                payload = await asyncio.to_thread(
-                    self._download_text,
-                    track["url"],
-                    url,
-                    cookie,
-                    {"Origin": "https://www.bilibili.com"},
+            if record["kind"] == "subtitle":
+                subtitle_by_page[page.page] = SubtitleResult(
+                    segments=record["segments"],
+                    language=record["language"],
+                    source="bilibili_ai_subtitle",
                 )
-                segments = parse_subtitle_payload(payload, "json")
-            except Exception as exc:
-                pages_to_transcribe.append(page)
-                first_error = first_error or f"{type(exc).__name__}: {exc}"
                 continue
-            if not segments:
-                pages_to_transcribe.append(page)
+            pages_to_transcribe.append(page)
+            if record["kind"] == "error":
+                first_error = first_error or str(record.get("error") or "")
+            elif record["kind"] == "empty":
                 saw_track_without_segments = True
-                continue
-            subtitle_by_page[page.page] = SubtitleResult(
-                segments=segments,
-                language=track["language"],
-                source="bilibili_ai_subtitle",
-            )
         if subtitle_by_page:
             merged, language = merge_bilibili_pages(selected, subtitle_by_page, {})
             return BiliSubtitleOutcome(
@@ -462,9 +514,11 @@ class VideoProcessor:
         """拉取某个分 P（cid）的字幕清单，返回首个可用 AI 字幕轨。"""
         headers = cls._bili_headers(cookie)
         params = {"bvid": bvid, "cid": cid} if bvid else {"aid": aid, "cid": cid}
+        # player/wbi/v2 必须带 w_rid：不签名的首发注定被拒再补签，多分 P 视频
+        # 逐页检查字幕时每页白等一个往返，80 页就是多出一分多钟
         player = cls._bilibili_get_json(
             "https://api.bilibili.com/x/player/wbi/v2",
-            params,
+            cls._wbi_sign(params),
             headers,
         )
         tracks = ((player.get("data") or {}).get("subtitle") or {}).get("subtitles") or []

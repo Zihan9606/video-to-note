@@ -1964,6 +1964,7 @@ function formatPageDuration(seconds) {
 }
 
 let biliLoginTimer = null;
+let biliLoginStarting = false;
 
 function initBiliLogin() {
     bindListener('biliLoginBtn', 'click', startBiliLogin);
@@ -1971,7 +1972,10 @@ function initBiliLogin() {
 }
 
 async function startBiliLogin() {
-    if (biliLoginTimer) return;
+    // 上一次 start 还在等待响应时不能再点：并发两个流程会各建一个轮询
+    // 定时器，而全局只记最后那个的 id，前一个就成了清不掉的幽灵轮询
+    if (biliLoginTimer || biliLoginStarting) return;
+    biliLoginStarting = true;
     try {
         const response = await fetch(`${API_BASE}/bili-login/start`, { method: 'POST' });
         const data = await readResponse(response, '启动扫码登录失败');
@@ -1988,21 +1992,45 @@ async function startBiliLogin() {
         byId('biliLoginStatus').textContent = data.message || '请在弹出的窗口中扫码登录';
         byId('biliLoginCancelBtn').hidden = false;
         byId('biliLoginBtn').disabled = true;
-        biliLoginTimer = window.setInterval(pollBiliLogin, 2000);
+        startBiliLoginPolling();
         pollBiliLogin();
     } catch (error) {
         showToast(`启动失败：${error.message}`, 'error');
+    } finally {
+        biliLoginStarting = false;
     }
 }
 
+// 定时器记进闭包：tick 时发现全局已不是自己（被 stop 清掉或被新轮询替换）
+// 就自杀，杜绝「stop 清错 id 后旧轮询继续每两秒弹一次提示」的泄漏路径
+function startBiliLoginPolling() {
+    const timer = window.setInterval(() => {
+        if (biliLoginTimer !== timer) {
+            window.clearInterval(timer);
+            return;
+        }
+        pollBiliLogin();
+    }, 2000);
+    biliLoginTimer = timer;
+}
+
 function fillBiliCredentials(cookies) {
-    byId('sessdata').value = cookies.sessdata || '';
-    byId('biliJct').value = cookies.bili_jct || '';
-    byId('buvid3').value = cookies.buvid3 || '';
+    const next = {
+        sessdata: cookies.sessdata || '',
+        biliJct: cookies.bili_jct || '',
+        buvid3: cookies.buvid3 || '',
+    };
+    const unchanged = byId('sessdata').value === next.sessdata
+        && byId('biliJct').value === next.biliJct
+        && byId('buvid3').value === next.buvid3;
+    byId('sessdata').value = next.sessdata;
+    byId('biliJct').value = next.biliJct;
+    byId('buvid3').value = next.buvid3;
     const section = byId('credentialsSection');
     section.open = true;
     section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    showToast('B 站凭据已导入并填入下方表单', 'success');
+    // 回填内容没变就不再弹：重复 ready 回调、重复点按钮都不该连环刷提示
+    if (!unchanged) showToast('B 站凭据已导入并填入下方表单', 'success');
     updateBiliHint();
 }
 

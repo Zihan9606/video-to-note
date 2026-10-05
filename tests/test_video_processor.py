@@ -971,3 +971,80 @@ def test_scan_qr_hint_only_when_the_failure_is_about_access(
         with pytest.raises(RuntimeError) as raised:
             processor._extract_bilibili_api_info(_BILI_URL, None)
         assert ("扫码导入" in str(raised.value)) is should_hint, payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_bilibili_subtitles_reports_progress_per_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """逐页检查字幕时每完成一页回调一次进度：进度条不能一动不动像卡死。"""
+    processor = VideoProcessor(tmp_path)
+    _monkeypatch_view(monkeypatch, _FAKE_VIEW)
+    monkeypatch.setattr(processor, "_cookie_header", lambda cookie: "SESSDATA=abc;")
+    monkeypatch.setattr(
+        processor,
+        "_bilibili_subtitle_track",
+        lambda bvid, aid, cid, cookie: {"language": "ai-zh", "url": "https://example.com/sub.json"},
+    )
+    monkeypatch.setattr(
+        processor, "_download_text", lambda *args, **kwargs: _SUBTITLE_JSON
+    )
+    seen: list[tuple[int, int]] = []
+
+    outcome = await processor.fetch_bilibili_subtitles(
+        "https://www.bilibili.com/video/BV1xM4y1z7Kt",
+        cookie={"sessdata": "abc"},
+        progress=lambda done, total: seen.append((done, total)),
+    )
+
+    assert outcome.reason == "ok"
+    # 并发完成顺序不定，但计数必须从 1 到 N 各出现一次
+    assert sorted(seen) == [(1, 2), (2, 2)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_bilibili_subtitles_stops_opening_pages_on_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """取消标记置位后不再开新页：用户点取消不该再等完整个逐页循环。"""
+    processor = VideoProcessor(tmp_path)
+    _monkeypatch_view(monkeypatch, _FAKE_VIEW)
+    monkeypatch.setattr(processor, "_cookie_header", lambda cookie: "SESSDATA=abc;")
+    calls: list[int] = []
+
+    def fake_track(bvid, aid, cid, cookie):
+        calls.append(cid)
+        return None
+
+    monkeypatch.setattr(processor, "_bilibili_subtitle_track", fake_track)
+
+    outcome = await processor.fetch_bilibili_subtitles(
+        "https://www.bilibili.com/video/BV1xM4y1z7Kt",
+        cookie={"sessdata": "abc"},
+        should_abort=lambda: True,
+    )
+
+    # 核心是一页都不再开：具体 outcome 由随后的取消流程丢弃，不作断言
+    assert calls == []
+    assert outcome.reason == "no_track"
+
+
+def test_bilibili_subtitle_track_signs_request_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """player/wbi/v2 必须带 w_rid：首发就签名，省掉一次注定被拒的往返。"""
+    processor = VideoProcessor(tmp_path)
+    captured: dict = {}
+
+    def fake_get_json(url, params, headers):
+        captured["params"] = params
+        return {"data": {"subtitle": {"subtitles": []}}}
+
+    # _bilibili_subtitle_track 是 classmethod，内部经 cls 查找，得 patch 类本身
+    monkeypatch.setattr(VideoProcessor, "_bilibili_get_json", staticmethod(fake_get_json))
+
+    assert processor._bilibili_subtitle_track("BV1xM4y1z7Kt", None, 101, None) is None
+
+    assert "w_rid" in captured["params"]
+    assert "wts" in captured["params"]
+    assert captured["params"]["cid"] == 101

@@ -1848,9 +1848,23 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                     video_processor.detect_source(source_url or "")
                     == VideoSource.BILIBILI
                 )
+
+                def subtitle_scan_progress(done: int, total: int) -> None:
+                    # 逐页检查可能持续一两分钟：进度消息每页刷新（轮询即可见），
+                    # 日志只在首/末与每 10 页落一条，免得 80 行刷屏
+                    message = f"正在逐页检查分 P 字幕 {done}/{total}"
+                    task.update(progress_message=message)
+                    if done == 1 or done % 10 == 0 or done == total:
+                        task["logs"].append(message)
+                        persist_task_runtime(task_id)
+
                 subtitle_outcome = (
                     await video_processor.fetch_bilibili_subtitles(
-                        source_url or "", cookie, only_pages=request.bilibili_pages or None
+                        source_url or "",
+                        cookie,
+                        only_pages=request.bilibili_pages or None,
+                        progress=subtitle_scan_progress,
+                        should_abort=lambda: bool(task.get("_cancel_requested")),
                     )
                     if is_bilibili
                     else None

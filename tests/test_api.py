@@ -1413,8 +1413,10 @@ async def test_pipeline_passes_bilibili_pages_to_subtitle_fetch(
 
     captured: dict = {}
 
-    async def fake_bili_subtitles(url, cookie=None, only_pages=None):
+    async def fake_bili_subtitles(url, cookie=None, only_pages=None, **kwargs):
         captured["only_pages"] = only_pages
+        captured["progress"] = kwargs.get("progress")
+        captured["should_abort"] = kwargs.get("should_abort")
         pages = (
             BiliPage(page=1, part="第一部分", cid=101, duration=60),
             BiliPage(page=2, part="第二部分", cid=102, duration=90),
@@ -1460,6 +1462,9 @@ async def test_pipeline_passes_bilibili_pages_to_subtitle_fetch(
     await main.process_video_task(task_id, request)
 
     assert captured["only_pages"] == [1, 2]
+    # 逐页检查必须挂上进度回报与取消检查，否则又回到「一动不动像卡死」
+    assert callable(captured["progress"])
+    assert callable(captured["should_abort"])
 
 
 def test_bili_pages_endpoint_returns_page_list(monkeypatch: pytest.MonkeyPatch) -> None:

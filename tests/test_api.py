@@ -2450,3 +2450,72 @@ def test_open_directory_rejects_paths_outside_workspace(
         assert response.status_code in (400, 404), f"{bad} 竟然放行了"
 
     assert opened == [], "校验不过时绝不能真的去开目录"
+
+
+@pytest.mark.asyncio
+async def test_write_per_page_transcripts_one_md_per_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """多分 P：合并稿之外按分 P 各写一份 md，文件名补零可排序、时间轴不偏移。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_id = "multi-page"
+    (tmp_path / task_id).mkdir()
+    outcome = BiliSubtitleOutcome(
+        result=SubtitleResult(
+            [TranscriptSegment(0, 5, "合并稿")], "zh-CN", "bilibili_ai_subtitle"
+        ),
+        reason="ok",
+        total_pages=10,
+        pages=(
+            BiliPage(page=1, part="第一部分", cid=101, duration=60),
+            BiliPage(page=2, part="第二部分", cid=102, duration=90),
+            BiliPage(page=10, part="第十部分", cid=110, duration=30),
+        ),
+        subtitle_by_page=(
+            (
+                1,
+                SubtitleResult(
+                    [TranscriptSegment(0, 10, "P1字幕")], "zh-CN", "bilibili_ai_subtitle"
+                ),
+            ),
+        ),
+    )
+    whisper_by_page = {2: {"segments": [TranscriptSegment(0, 5, "P2转写")]}}
+
+    written = await main.write_per_page_transcripts(task_id, outcome, whisper_by_page)
+
+    assert written == 3
+    task_dir = tmp_path / task_id
+    names = sorted(path.name for path in task_dir.glob("transcript_p*.md"))
+    assert names == ["transcript_p01.md", "transcript_p02.md", "transcript_p10.md"]
+    page_one = (task_dir / "transcript_p01.md").read_text(encoding="utf-8")
+    assert "P1 第一部分" in page_one
+    assert "P1字幕" in page_one
+    assert "[00:00-00:10]" in page_one
+    page_two = (task_dir / "transcript_p02.md").read_text(encoding="utf-8")
+    assert "P2转写" in page_two
+    # 时间轴从本 P 开头计，不带前序分 P 的累计偏移
+    assert "[00:00-00:05]" in page_two
+    page_ten = (task_dir / "transcript_p10.md").read_text(encoding="utf-8")
+    assert "（本分 P 没有可用的字幕或转写内容）" in page_ten
+
+
+@pytest.mark.asyncio
+async def test_write_per_page_transcripts_single_page_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单分 P 视频不生成额外文档：常规视频的产物目录保持原样。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_id = "single-page"
+    (tmp_path / task_id).mkdir()
+    outcome = BiliSubtitleOutcome(
+        result=None,
+        reason="ok",
+        total_pages=1,
+        pages=(BiliPage(page=1, part="唯一", cid=101, duration=30),),
+    )
+
+    written = await main.write_per_page_transcripts(task_id, outcome, {})
+
+    assert written == 0
+    assert list((tmp_path / task_id).glob("transcript_p*.md")) == []

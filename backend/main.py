@@ -63,6 +63,7 @@ from .transcript import (
 )
 from .video_processor import (
     FRAMES_DIR_NAME,
+    BiliSubtitleOutcome,
     VideoProcessor,
     VideoSource,
     bilibili_page_url,
@@ -1743,6 +1744,11 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
         cookie = douyin_cookie if source_kind == VideoSource.DOUYIN else bili_cookie
         transcript_result = load_transcript_result(resume_dir) if resume_dir else None
         bili_pages_to_transcribe: list = []
+        # 多分 P 的每 P 数据源：outcome 提供分 P 清单与 AI 字幕，whisper_by_page
+        # 提供语音转写结果。放在这里初始化，让写 transcript_p*.md 的路径
+        # （复用转录、非 B 站等分支下它们保持空）不必判断变量是否已赋值
+        subtitle_outcome = None
+        whisper_by_page: dict[int, dict] = {}
 
         if transcript_result:
             set_progress(task, 1, "恢复任务信息", 8, "正在读取已有任务信息")
@@ -1855,7 +1861,7 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             set_progress(task, 3, "准备音频", 25, "正在准备音频")
             if bili_pages_to_transcribe:
                 # 多分 P：对没有 AI 字幕的分 P 逐个下载音频并转写，再按顺序合并
-                whisper_by_page: dict[int, dict] = {}
+                whisper_by_page = {}
                 for page in bili_pages_to_transcribe:
                     raise_if_cancel_requested(task)
                     set_progress(
@@ -1997,6 +2003,14 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             f"文字质量检查：{quality['characters']} 字，语音覆盖 {quality['speech_coverage']:.0%}"
         )
         await write_transcript_files(task_id, segments, transcript_result)
+        if subtitle_outcome is not None:
+            per_page_count = await write_per_page_transcripts(
+                task_id, subtitle_outcome, whisper_by_page
+            )
+            if per_page_count:
+                task["logs"].append(
+                    f"已按分 P 各写一份转录文档：共 {per_page_count} 个 transcript_p*.md"
+                )
         if (
             transcript_result["source"] in {"faster_whisper", "paraformer"}
             and quality["insufficient"]
@@ -2214,6 +2228,44 @@ async def write_transcript_files(
         task_dir / "transcript.md",
         ("# 带时间戳转录\n\n", segments_to_prompt(segments), "\n"),
     )
+
+
+async def write_per_page_transcripts(
+    task_id: str,
+    outcome: BiliSubtitleOutcome,
+    whisper_by_page: dict[int, dict[str, Any]],
+) -> int:
+    """多分 P：合并稿之外，再给每个分 P 各写一份 transcript_pNN.md。
+
+    每份文档只含本 P 的片段、时间轴从本 P 开头计（不做累计偏移），标题带
+    分 P 名。文件名按最大页码补零，目录里按文件名排序即分 P 顺序。
+    数据源优先取该 P 的 AI 字幕，没有字幕才用语音转写结果。
+    返回写出的文档数（单分 P 视频不写，返回 0）。
+    """
+    pages = outcome.pages
+    if len(pages) <= 1:
+        return 0
+    task_dir = WORKSPACE_DIR / task_id
+    subtitles = dict(outcome.subtitle_by_page)
+    width = max(2, len(str(max(page.page for page in pages))))
+    written = 0
+    for page in pages:
+        if page.page in subtitles:
+            page_segments = subtitles[page.page].segments
+        else:
+            page_segments = (whisper_by_page.get(page.page) or {}).get("segments") or []
+        heading = f"# 带时间戳转录（P{page.page} {page.part}）\n\n"
+        body = (
+            segments_to_prompt(page_segments)
+            if page_segments
+            else "（本分 P 没有可用的字幕或转写内容）"
+        )
+        await _write_atomically(
+            task_dir / f"transcript_p{page.page:0{width}d}.md",
+            (heading, body, "\n"),
+        )
+        written += 1
+    return written
 
 
 async def _write_atomically(path: Path, chunks: tuple[str, ...]) -> None:

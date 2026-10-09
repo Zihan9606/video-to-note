@@ -1433,17 +1433,21 @@ class BiliSpaceCrawlRequest(BaseModel):
 
 @app.post("/api/bili-space-crawl")
 async def crawl_space_page(request: BiliSpaceCrawlRequest) -> dict[str, Any]:
-    """用真实浏览器打开 space 页面并滚动抓取全部视频地址。
+    """用真实浏览器打开 space 页面并逐页点击分页器，抓取全部视频地址。
 
     与 `/api/bili-space-videos`（直连投稿接口）互补：那条路未登录时按 IP 限流，
     这条路走页面自己的请求路径，实测通过率明显更高；代价是要开一个浏览器窗口。
 
+    `url` 可以是投稿页 `.../upload/video`，也可以是**合集页**
+    `.../lists/<合集号>?type=season`——按链接自动识别，合集结果存
+    `up_lists/<uid>_season_<id>.json`，与投稿缓存分开。
+
     页面数据请求偶发失败时 B 站会把列表显示成"还没有投过视频"，所以抓取会用页面
     顶部的总数校验并自动重开页面重试，不会把一次网络抖动当成"这个 UP 主没视频"。
-    抓到的地址并入同一份本地缓存，两条路线的地址汇在一起。
+    抓到的地址并入本地缓存，缺的页会记下来下次直接补。
     """
     try:
-        space_page.parse_space_input(request.url)
+        space_page.parse_space_target(request.url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

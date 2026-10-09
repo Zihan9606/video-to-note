@@ -635,7 +635,9 @@ async def crawl_space_page(url: str, max_attempts: int = 4) -> dict[str, Any]:
     与 `list_up_videos` 相同的本地缓存。
 
     Args:
-        url: 空间链接，如 `https://space.bilibili.com/123456/upload/video`（也接受纯 UID）。
+        url: 空间链接——投稿页 `https://space.bilibili.com/123456/upload/video`、
+            **合集页** `https://space.bilibili.com/123456/lists/7817323?type=season`、
+            或纯 UID（按链接自动识别，合集结果单独存 `up_lists/<uid>_season_<id>.json`）。
         max_attempts: 列表没渲染出来时最多重开几次页面，1-10，默认 4。
     """
     max_attempts = max(1, min(int(max_attempts or 4), 10))

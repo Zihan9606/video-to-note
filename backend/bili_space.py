@@ -238,16 +238,21 @@ def _yt_dlp_page(uid: int, *, limit: int | None = None) -> list[UpVideo]:
 CACHE_DIR_NAME = "up_lists"
 
 
-def _cache_path(cache_dir: Path | None, uid: int) -> Path | None:
+def _cache_path(cache_dir: Path | None, uid: int, season_id: str | None = None) -> Path | None:
     if not cache_dir:
         return None
     # UID 是调用方传进来的整数，已经在 fetch_up_videos 里转过 int，这里不再接受任意字符串
-    return Path(cache_dir) / CACHE_DIR_NAME / f"{int(uid)}.json"
+    # 合集另开一个文件：它只是该 UP 全部投稿的**子集**（如 97/239），混进同一份会让
+    # "全量已拉齐"的判断失真，也会让投稿列表与合集互相覆盖。
+    base = f"{int(uid)}_season_{season_id}" if season_id else f"{int(uid)}"
+    return Path(cache_dir) / CACHE_DIR_NAME / f"{base}.json"
 
 
-def load_cache(cache_dir: Path | None, uid: int) -> dict[str, Any] | None:
+def load_cache(
+    cache_dir: Path | None, uid: int, season_id: str | None = None
+) -> dict[str, Any] | None:
     """读本地缓存；文件损坏或格式不对一律当作没有缓存（绝不阻断拉取）。"""
-    path = _cache_path(cache_dir, uid)
+    path = _cache_path(cache_dir, uid, season_id)
     if path is None or not path.is_file():
         return None
     try:
@@ -285,6 +290,7 @@ def save_cache(
     total: int | None = None,
     previous: dict[str, Any] | None = None,
     missing_pages: list[int] | None = None,
+    season_id: str | None = None,
 ) -> dict[str, Any] | None:
     """把结果并入本地缓存（按 bvid 去重、按投稿时间倒序），返回新缓存。
 
@@ -295,7 +301,7 @@ def save_cache(
     缺的可能是第 2、4 页）：显式传入就用传的；没传且本次已拉全则清空，否则保留
     上次记的——两条路线共用这份缓存，不能互相把对方的进度抹掉。
     """
-    path = _cache_path(cache_dir, uid)
+    path = _cache_path(cache_dir, uid, season_id)
     if path is None:
         return None
     merged: dict[str, UpVideo] = {}

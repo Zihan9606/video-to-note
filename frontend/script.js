@@ -1819,7 +1819,7 @@ async function crawlSpacePage() {
     const input = byId('upSpaceUrl');
     const value = ((input && input.value) || '').trim();
     if (!value) {
-        setUpListStatus('请先粘贴空间链接，形如 space.bilibili.com/123456/upload/video', 'error');
+        setUpListStatus('请先粘贴空间链接：…/upload/video 或合集 …/lists/<合集号>?type=season', 'error');
         return;
     }
     const button = byId('upCrawlBtn');

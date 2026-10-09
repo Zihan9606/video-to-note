@@ -498,6 +498,118 @@ def test_rendered_but_all_known_is_not_a_missing_page(monkeypatch, tmp_path) -> 
     assert cached.get("missing_pages") == [], "渲染成功就不算缺页"
 
 
+def test_parse_space_target_recognizes_season_link() -> None:
+    """合集链接必须识别出合集号——丢掉它就会抓成「该 UP 的全部投稿」。"""
+    from backend.space_page import parse_space_target
+
+    target = parse_space_target("https://space.bilibili.com/404096387/lists/7817323?type=season")
+    assert target.uid == "404096387"
+    assert target.season_id == "7817323"
+    assert target.is_season is True
+    assert target.url == "https://space.bilibili.com/404096387/lists/7817323?type=season"
+
+    uploads = parse_space_target("https://space.bilibili.com/404096387/upload/video")
+    assert uploads.season_id is None
+    assert uploads.kind == "uploads"
+
+    # 同一个旧函数仍然按老规矩办事（只认 UID），别因为它改了就影响已有调用方
+    assert parse_space_input("https://space.bilibili.com/404096387/lists/7817323?type=season") == (
+        "https://space.bilibili.com/404096387/upload/video",
+        "404096387",
+    )
+
+
+def test_season_cache_is_separate_from_uploads_cache(tmp_path) -> None:
+    """合集缓存必须与投稿缓存分文件。
+
+    合集只是该 UP 投稿的子集（实测 97/239）：混进同一份，"全量已拉齐"会误判，
+    两条路线还会互相覆盖。
+    """
+    from backend.bili_space import UpVideo, load_cache, save_cache
+
+    def video(seed: str) -> UpVideo:
+        return UpVideo(bvid=_bvid(seed), url=f"https://www.bilibili.com/video/{_bvid(seed)}",
+                       title=seed, created=1700000000)
+
+    save_cache(tmp_path, 404096387, [video("up1")], complete=False, fetched_pages=6, total=239)
+    save_cache(tmp_path, 404096387, [video("s1")], complete=True, fetched_pages=4,
+               total=97, season_id="7817323")
+
+    uploads = load_cache(tmp_path, 404096387)
+    season = load_cache(tmp_path, 404096387, "7817323")
+    assert uploads is not None and uploads["complete"] is False, "合集的 complete 不能算到投稿头上"
+    assert season is not None and season["complete"] is True
+
+    names = sorted(p.name for p in (tmp_path / "up_lists").iterdir())
+    assert names == ["404096387.json", "404096387_season_7817323.json"]
+
+
+def test_crawl_season_link_opens_and_caches_season_page(monkeypatch, tmp_path) -> None:
+    """贴合集链接：打开的是合集页、写的是合集缓存、message 里带合集名。"""
+    from backend.bili_space import load_cache
+
+    browser = FakeBrowser(
+        probes=[{"rendered": 30, "total": 97, "pageCount": 4, "seasonTitle": "指数测评合集"}],
+        collects=[[_card(_bvid("s1"))]],
+        next_results=[False],
+    )
+    install(monkeypatch, browser)
+
+    result = crawl_space_page(
+        "https://space.bilibili.com/404096387/lists/7817323?type=season",
+        max_pages=5, sleep=NOSLEEP, cache_dir=tmp_path,
+    )
+
+    assert browser.navigations[0].endswith("/lists/7817323?type=season"), "打开的必须是合集页"
+    assert (tmp_path / "up_lists" / "404096387_season_7817323.json").is_file()
+    assert not (tmp_path / "up_lists" / "404096387.json").exists(), "不该动投稿缓存"
+    assert "指数测评合集" in result.message
+    assert result.total == 97, "总数应从「共 4 页 / 97 个」读出，而不是「视频 9月24日」里的 9"
+    cached = load_cache(tmp_path, 404096387, "7817323")
+    assert cached is not None and cached["total"] == 97
+    # fake 只给了 1 条卡片（1 < 97），本来就不完整——complete 按合并后的总数算
+    assert cached["complete"] is False
+
+
+def test_harvest_backfills_api_fields_when_they_arrive_late(monkeypatch) -> None:
+    """接口响应比 DOM 晚到：先被 DOM 占位，之后必须补回接口里的时长与精确时间。
+
+    真机上 Playwright 的 response 回调是在 evaluate 期间才 flush 的，所以
+    `_harvest` 第一次读接口通常是空的——不补的话，97 条会全部停在 DOM 的
+    残缺版本上（合集卡片根本没有时长，时间也只是「3月30日」）。
+    """
+    bvid = _bvid("late")
+    browser = FakeBrowser(
+        probes=[{"rendered": 40, "total": 185}],
+        collects=[[{"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}",
+                    "title": "DOM 版标题", "published": "3月30日"}]],
+        next_results=[False],
+    )
+    install(monkeypatch, browser)
+
+    calls = {"n": 0}
+    late_api = [{
+        "bvid": bvid, "title": "接口版标题", "created": 1774876497,
+        "duration": "08:10", "author": "UP",
+    }]
+
+    def api_arrives_after_dom(_session):
+        calls["n"] += 1
+        # 第一次调用（DOM evaluate 之前）接口还没回来
+        return [] if calls["n"] == 1 else late_api
+
+    monkeypatch.setattr(space_page, "_api_items", api_arrives_after_dom)
+
+    result = crawl_space_page("https://space.bilibili.com/1/upload/video",
+                              max_pages=5, sleep=NOSLEEP)
+
+    assert calls["n"] >= 2, "至少要读两次接口：DOM 之前一次、之后一次"
+    video = next(v for v in result.videos if v.bvid == bvid)
+    assert video.duration == "08:10", "接口晚到必须把时长补回来"
+    assert video.created == 1774876497, "接口的精确时间戳优先于「3月30日」推算值"
+    assert video.title == "接口版标题"
+
+
 def test_api_rejects_bad_space_url() -> None:
     client = TestClient(main.app)
 

@@ -41,6 +41,12 @@ DEFAULT_WAIT_SECONDS = 2.0
 DEFAULT_PAGE_LOAD_WAIT = 5.0
 
 SPACE_URL_RE = re.compile(r"space\.bilibili\.com/(?P<uid>\d+)", re.I)
+# 合集/系列页：space.bilibili.com/<uid>/lists/<season_id>?type=season
+# 必须先于 SPACE_URL_RE 判定——否则 uid 抓到了、/lists/<id> 却被丢掉，
+# 合集链接会被静默当成"该 UP 的全部投稿"。
+LISTS_URL_RE = re.compile(
+    r"space\.bilibili\.com/(?P<uid>\d+)/lists/(?P<season>\d+)", re.I
+)
 BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 
 ABSOLUTE_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
@@ -66,6 +72,9 @@ def parse_space_input(value: str) -> tuple[str, str]:
 
     接受完整空间链接（含 /upload/video 等子路径）、纯 UID；识别不了就抛错，
     绝不猜一个地址出来。
+
+    注意：合集链接（`/lists/<id>`）里的合集号会被这个函数**丢掉**，
+    只识别 UID——要抓合集请用 `parse_space_target`。
     """
     text = (value or "").strip()
     if not text:
@@ -79,6 +88,44 @@ def parse_space_input(value: str) -> tuple[str, str]:
     if "space.bilibili.com" in text:
         raise ValueError("这个空间链接里没有 UID，形如 space.bilibili.com/<数字>")
     raise ValueError("请粘贴形如 space.bilibili.com/123456/upload/video 的链接，或纯数字 UID")
+
+
+@dataclass(frozen=True)
+class SpaceTarget:
+    """一次抓取的目标：要么是 UP 主全部投稿，要么是某个合集。"""
+
+    url: str
+    uid: str
+    season_id: str | None = None
+    season_title: str = ""
+
+    @property
+    def kind(self) -> str:
+        return "season" if self.season_id else "uploads"
+
+    @property
+    def is_season(self) -> bool:
+        return bool(self.season_id)
+
+
+def parse_space_target(value: str) -> SpaceTarget:
+    """识别合集链接，其余情况退回 `parse_space_input` 的规则。
+
+    合集链接长这样：`space.bilibili.com/404096387/lists/7817323?type=season`。
+    少了这层判断，用户贴的合集链接会被当成"整个 UP 的投稿"，抓出来 239 条
+    而不是合集里的 97 条——而且看起来一切正常，最难被发现。
+    """
+    text = (value or "").strip()
+    match = LISTS_URL_RE.search(text)
+    if match:
+        uid, season = match.group("uid"), match.group("season")
+        return SpaceTarget(
+            url=f"https://space.bilibili.com/{uid}/lists/{season}?type=season",
+            uid=uid,
+            season_id=season,
+        )
+    url, uid = parse_space_input(text)
+    return SpaceTarget(url=url, uid=uid)
 
 
 def parse_relative_time(text: str, *, now: float | None = None) -> int:
@@ -129,6 +176,25 @@ def parse_relative_time(text: str, *, now: float | None = None) -> int:
     return 0
 
 
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _seconds_to_mmss(value: Any) -> str:
+    """合集接口给的是秒数（490），投稿接口给的是「08:10」——统一成后者。
+
+    时长只用于展示，但两条路线的数据会并进同一份缓存，格式不一致会让
+    界面上一半视频写秒数、一半写分钟。
+    """
+    total = _to_int(value)
+    if total <= 0:
+        return ""
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 # ---------------------------------------------------------------------------
 # 页面脚本（裸 return，由 _js 统一包成箭头函数）
 # ---------------------------------------------------------------------------
@@ -136,10 +202,23 @@ def parse_relative_time(text: str, *, now: float | None = None) -> int:
 _PROBE_SCRIPT = r"""
 const links = document.querySelectorAll('.bili-video-card a[href*="/video/BV"], a.bili-cover-card[href*="/video/BV"]');
 const bodyText = document.body.innerText || '';
-const totalMatch = bodyText.match(/视频\s*(\d+)/);
+// 投稿页写「视频 239」，合集页写「97个视频」、分页器写「共 4 页 / 97 个」。
+// 三处都认：只留一个正则会在另一类页面上永远读出 0，进而把页数算错。
+// 优先级：分页器的「共 4 页 / 97 个」 > 合集的「97个视频」 > 投稿页的「视频 239」。
+// 顺序反了会出事：合集页那句「97个视频 9月24日更新」里，「视频」后面紧跟的数字
+// 是 9（月），于是被读成 9 条——比 0 更坏，因为看起来像那么回事。
+const uploadMatch = bodyText.match(/视频\s*(\d+)/);
+const seasonMatch = bodyText.match(/(\d+)\s*个视频/);
+const pageMatch = bodyText.match(/共\s*(\d+)\s*页\s*\/\s*(\d+)\s*个/);
+const titleMatch = bodyText.match(/合集[·・]\s*([^\n]+)/);
 return {
     rendered: links.length,
-    total: totalMatch ? Number(totalMatch[1]) : 0,
+    total: pageMatch ? Number(pageMatch[2])
+        : (seasonMatch ? Number(seasonMatch[1])
+            : (uploadMatch ? Number(uploadMatch[1]) : 0)),
+    // 分页器直接写出的总页数：比 total/每页条数 推算更准（每页条数两条路线不同）
+    pageCount: pageMatch ? Number(pageMatch[1]) : 0,
+    seasonTitle: titleMatch ? titleMatch[1].trim().slice(0, 80) : '',
     ready: document.readyState,
 };
 """
@@ -190,6 +269,8 @@ return active ? Number((active.innerText || '').trim()) : 0;
 
 # 页面用的是 ps=40（与接口路线的 30 不同，别搞混）
 SPACE_PAGE_SIZE = 40
+# 合集页每页 30 条（`seasons_archives_list` 的 ps），实测 97 条 → 4 页
+SEASON_PAGE_SIZE = 30
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +300,35 @@ def _open() -> _Session:
     session = _Session(playwright=playwright, browser=browser, page=page)
 
     def on_response(response: Any) -> None:
-        if "arc/search" not in response.url:
+        url = response.url
+        if "seasons_archives_list" in url:
+            # 合集页的数据源。字段比 arc/search 还好：pubdate 是精确时间戳，
+            # 不用再去猜「8月27日」是哪一年。
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                return
+            page_info = data.get("page") or {}
+            session.captured.append({
+                "pn": page_info.get("num") or page_info.get("pn"),
+                "total": page_info.get("total") or page_info.get("count"),
+                "items": [
+                    {
+                        "bvid": str(item.get("bvid") or ""),
+                        "title": str(item.get("title") or ""),
+                        "created": _to_int(item.get("pubdate") or item.get("ctime")),
+                        "duration": _seconds_to_mmss(item.get("duration")),
+                        "author": "",
+                    }
+                    for item in data.get("archives") or []
+                    if isinstance(item, dict) and item.get("bvid")
+                ],
+            })
+            return
+        if "arc/search" not in url:
             return
         try:
             payload = response.json()
@@ -363,10 +472,16 @@ def crawl_space_page(
 ) -> SpacePageResult:
     """打开 space 页面，逐页点击分页器，收集全部视频地址。
 
-    与 `bili_space.fetch_up_videos` 一样会把结果并进本地缓存（同一个 uid），
-    所以两条路线拿到的地址汇在同一份 `workspace/up_lists/<uid>.json` 里。
+    既能抓 UP 主全部投稿（`/upload/video`），也能抓某个合集
+    （`/lists/<id>?type=season`）——识别交给你贴进来的链接，两者共用同一套
+    翻页、接口拦截与增量逻辑。
+
+    与 `bili_space.fetch_up_videos` 一样把结果并进本地缓存：投稿存
+    `workspace/up_lists/<uid>.json`，合集另存 `<uid>_season_<id>.json`
+    ——合集只是投稿的子集（如 97/239），混存会让"全量已拉齐"判断失真。
     """
-    url, uid = parse_space_input(value)
+    target = parse_space_target(value)
+    url, uid = target.url, target.uid
     result = SpacePageResult(url=url, uid=uid)
 
     try:
@@ -380,6 +495,8 @@ def crawl_space_page(
 
     collected: dict[str, UpVideo] = {}
     total: int | None = None
+    page_count = 0
+    season_title = ""
     rendered = 0
 
     try:
@@ -393,6 +510,10 @@ def crawl_space_page(
                 rendered = int(probe.get("rendered") or 0)
                 if probe.get("total"):
                     total = int(probe["total"])
+                if probe.get("pageCount"):
+                    page_count = int(probe["pageCount"])
+                if probe.get("seasonTitle") and not season_title:
+                    season_title = str(probe["seasonTitle"])
                 if rendered:
                     break
             if rendered:
@@ -416,7 +537,9 @@ def crawl_space_page(
         #   本地已完整且够数 → 只看第 1 页（新视频只会出现在最前），撞到全已知就收工
         #   本地记着缺页     → 只点缺的那几页（上一次被拦的第 2、4 页之类）
         #   首次 / 缺页未知   → 全部页走一遍
-        previous = load_cache(cache_dir, int(uid)) if cache_dir else None
+        previous = (
+            load_cache(cache_dir, int(uid), target.season_id) if cache_dir else None
+        )
         known = {
             str(item.get("bvid") or "")
             for item in (previous or {}).get("videos") or []
@@ -424,7 +547,15 @@ def crawl_space_page(
         }
         known.discard("")
 
-        total_pages = math.ceil(total / SPACE_PAGE_SIZE) if total else max_pages
+        # 总页数：优先用分页器自己写明的「共 4 页」，其次才按 total 推算。
+        # 两条路线每页条数不同（投稿 40、合集 30），推算弄错一条就会少点页、静默漏一半。
+        if page_count:
+            total_pages = page_count
+        elif total:
+            page_size = SEASON_PAGE_SIZE if target.is_season else SPACE_PAGE_SIZE
+            total_pages = math.ceil(total / page_size)
+        else:
+            total_pages = max_pages
         total_pages = max(1, min(total_pages, max_pages))
 
         cached_complete = bool(previous and previous.get("complete")) and (
@@ -473,6 +604,10 @@ def crawl_space_page(
             if rendered:
                 missing.remove(page_no)
 
+        # 收尾补一次：最后一页的接口响应通常在最后一次 evaluate **之后**才落地，
+        # 而后面已经没有下一次 _harvest 来吸收它了——不补的话，最后一页永远缺时长。
+        _absorb_api(session, collected, overwrite=True)
+
     except Exception as exc:
         result.message = f"浏览器抓取中断：{exc}"
         return result
@@ -514,14 +649,16 @@ def crawl_space_page(
             previous=previous,
             # 把这次还缺的页记下来：下次抓取只补这几页，不用再从第 1 页全翻一遍
             missing_pages=missing,
+            season_id=target.season_id,
         )
         count = len((saved or {}).get("videos") or [])
         suffix = f"，已并入本地缓存（现有 {count} 条）"
     else:
         suffix = ""
 
+    where = f"合集「{season_title}」" if season_title else "页面"
     result.message = (
-        f"本次页面抓取 {fetched_now} 条"
+        f"本次{where}抓取 {fetched_now} 条"
         + (f"，本地合计 {len(result.videos)} 条" if len(result.videos) != fetched_now else "")
         + (f"（页面显示共 {result.total} 条）" if result.total else "")
         + f"，翻了 {result.rounds} 页{suffix}"
@@ -536,6 +673,37 @@ def crawl_space_page(
     elif result.total and len(result.videos) < result.total:
         result.message += f"；还有 {result.total - len(result.videos)} 条没拿到，再抓一次可继续补齐"
     return result
+
+
+def _merge_video(base: UpVideo, incoming: UpVideo) -> UpVideo:
+    """逐字段取非空，`incoming` 优先。"""
+    return UpVideo(
+        bvid=base.bvid,
+        url=base.url or incoming.url,
+        title=incoming.title or base.title,
+        created=incoming.created or base.created,
+        duration=incoming.duration or base.duration,
+        author=incoming.author or base.author,
+    )
+
+
+def _absorb_api(
+    session: _Session, collected: dict[str, UpVideo], *, overwrite: bool
+) -> None:
+    """把拦到的接口条目并进 collected。
+
+    `overwrite=True` 时按字段合并而非跳过——第一次抓到的条目可能来自 DOM
+    （缺时长、时间是「3月30日」推算的），接口后来才到，得允许它补齐。
+    """
+    for item in _api_items(session):
+        video = _video_from_api(item)
+        if not video:
+            continue
+        existing = collected.get(video.bvid)
+        if existing is None:
+            collected[video.bvid] = video
+        elif overwrite:
+            collected[video.bvid] = _merge_video(existing, video)
 
 
 def _harvest(
@@ -554,10 +722,7 @@ def _harvest(
     before = len(collected)
     page_total: int | None = None
 
-    for item in _api_items(session):
-        video = _video_from_api(item)
-        if video and video.bvid not in collected:
-            collected[video.bvid] = video
+    _absorb_api(session, collected, overwrite=False)
 
     rendered = 0
     for item in _js(session, _COLLECT_SCRIPT) or []:
@@ -569,6 +734,13 @@ def _harvest(
         rendered += 1
         if video.bvid not in collected:
             collected[video.bvid] = video
+
+    # 关键一步：Playwright 的 response 回调是在 evaluate 期间才 flush 的，
+    # 于是本页的接口数据总是**晚于**上面那次读取才落地。只读一次的话，
+    # 条目会被 DOM 的残缺版本先占位（合集页卡片没有时长、时间还是「3月30日」），
+    # 而 `not in collected` 又让它再也补不回来——97 条全部丢失时长就是这么来的。
+    # 所以读完 DOM 再吸收一次，并允许按字段合并覆盖。
+    _absorb_api(session, collected, overwrite=True)
 
     probe = _js(session, _PROBE_SCRIPT) or {}
     if probe.get("total"):

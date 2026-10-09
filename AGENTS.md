@@ -91,6 +91,12 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
   接口响应，字段更全且实测更稳，但要开窗口。页面数据请求偶发失败时 B 站会把列表显示成
   "还没有投过视频"——**必须用页面顶部的总数校验并重开页面**，绝不能报成"UP 主没视频"。
   页面路线首次需要 `.venv/bin/python -m playwright install chromium`（`bootstrap.py` 会自动装）。
+- **页面路线也抓合集**：`.../lists/<合集号>?type=season` 由 `parse_space_target` 识别
+  （`parse_space_input` 会丢掉合集号，别用它校验这类链接）。合集缓存是独立文件
+  `<uid>_season_<id>.json`——合集只是投稿的子集，混存会让"全量已拉齐"判断失真。
+- **改 `_harvest` 时注意时序**：Playwright 的 `response` 回调在 `evaluate` 期间才 flush，
+  所以"先读接口、再读 DOM"会让接口数据总是晚一拍，条目被 DOM 的残缺版本占位后再也补不回来
+  （实测表现为 97 条全部丢失时长）。末尾必须再吸收一次接口并按字段合并。
 
 ## 相关文档
 

@@ -169,7 +169,10 @@ if [ "$RELOAD_VALUE" = "true" ]; then
     UVICORN_ARGS+=(--reload)
 fi
 
-"$PYTHON" "${UVICORN_ARGS[@]}" >"$STDOUT_PATH" 2>"$STDERR_PATH" &
+# nohup + 关掉 stdin：服务必须比启动它的那个会话活得久。
+# 否则启动脚本一退出（或宿主会话被回收），uvicorn 会跟着没——状态文件却还留着，
+# 下次 start 会以为实例还在。
+nohup "$PYTHON" "${UVICORN_ARGS[@]}" >"$STDOUT_PATH" 2>"$STDERR_PATH" </dev/null &
 LAUNCHER_PID=$!
 
 URL="http://${BIND_HOST}:$PORT"

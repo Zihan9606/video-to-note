@@ -954,6 +954,8 @@ function handleModelChange() {
 function bindPreferenceAutoSave() {
     ['whisperModel', 'summaryStyle', 'reasoningEffort', 'includeScreenshots', 'useGpu']
         .forEach((id) => bindListener(id, 'change', persistGlobals));
+    // 勾/取消加速时立刻收放模型档位，而不是等下次刷新
+    bindListener('useGpu', 'change', applyMlxModelRestriction);
     document.querySelectorAll('input[name="processingMode"]').forEach((input) => {
         input.addEventListener('change', persistGlobals);
     });
@@ -2150,6 +2152,32 @@ const WHISPER_MODEL_SIZES = {
 
 let whisperFallbackNotified = false;
 
+// M 系加速（MLX）的能力边界：supported 之外的档位没有可用的 GPU 权重。
+// 勾了加速就必须切过去，否则转写会直接失败——比不可选更烦人。
+let mlxInfo = { available: false, supported: [], installed: false };
+
+function applyMlxModelRestriction() {
+    const select = byId('whisperModel');
+    const gpu = byId('useGpu');
+    if (!select || !gpu) return;
+    const restrict = Boolean(gpu.checked && mlxInfo.available && mlxInfo.installed);
+    const supported = mlxInfo.supported || [];
+    Array.from(select.options).forEach((option) => {
+        const unsupported = restrict && !supported.includes(option.value);
+        option.disabled = unsupported;
+        option.title = unsupported
+            ? `M 系加速暂不支持这一档（当前支持：${supported.join('、')}）`
+            : '';
+    });
+    if (!restrict) return;
+    const current = select.selectedOptions[0];
+    if (current && current.disabled && supported.length) {
+        select.value = supported[0];
+        const label = select.selectedOptions[0]?.textContent || supported[0];
+        setUpListStatus(`已切换到支持 M 系加速的档位：${label}`, '');
+    }
+}
+
 function snapshotWhisperLabels() {
     Array.from(byId('whisperModel').options).forEach((option) => {
         option.dataset.baseLabel = option.textContent;
@@ -2162,6 +2190,20 @@ async function refreshWhisperModelHints() {
         const data = await readResponse(response, '读取模型状态失败');
         const byIdMap = {};
         (data.models || []).forEach((model) => { byIdMap[model.id] = model; });
+        if (data.mlx) {
+            mlxInfo = {
+                available: Boolean(data.mlx.available),
+                supported: data.mlx.supported || [],
+                installed: Boolean(data.mlx.installed),
+            };
+            // 平台不同按钮说法不同：N 卡与 M 系加速是两条互不相干的路径
+            const gpuLabel = byId('useGpu')?.closest('label')?.querySelector('span');
+            if (gpuLabel) {
+                gpuLabel.textContent = mlxInfo.available
+                    ? '启用 M 系芯片加速（Metal）'
+                    : '启用 NVIDIA GPU 加速';
+            }
+        }
         Array.from(byId('whisperModel').options).forEach((option) => {
             const model = byIdMap[option.value];
             const baseLabel = option.dataset.baseLabel || option.textContent;
@@ -2176,6 +2218,7 @@ async function refreshWhisperModelHints() {
                 option.textContent = `${baseLabel}（未缓存，首次使用需下载 ${size}）`;
             }
         });
+        applyMlxModelRestriction();
     } catch {
         // 后端不可达时保持默认文案
     }

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
+import platform
+import shutil
+import tempfile
 import threading
 import time
 import urllib.error
@@ -11,6 +16,8 @@ from typing import Any, Callable
 
 from .download import download_to_file
 from .transcript import TranscriptSegment
+
+LOGGER = logging.getLogger(__name__)
 
 # 缓存文件完整性的下限校验：历史上中断的下载可能遗留只有几十字节的
 # 损坏 model.bin（文件存在且非空，但 CTranslate2 无法加载），仅靠
@@ -55,6 +62,116 @@ MODEL_REQUIRED_FILES = {
     "belle-turbo-zh": CT2_MODEL_FILES,
 }
 
+# ---------------------------------------------------------------------------
+# Apple Silicon 的 GPU 加速（MLX）
+#
+# faster-whisper 背后的 CTranslate2 官方 pip wheel **不含 Metal 后端**（它只在
+# 源码里支持，wheel 没编进去，实测 site-packages 里没有任何 metal 文件），
+# 所以 M 系芯片想用核显只能换推理引擎——这里选 Apple 官方的 MLX。
+#
+# 只有下面列出来的档位有可用的 MLX 权重（belle 那档是把社区转好的权重补上
+# mlx-whisper 认的 config 后自托管的，见 scripts/convert_mlx_model.py）。
+# 勾了"加速"却选了不在名单里的档位，界面会禁用它，后端也会拒绝——不静默降级，
+# 否则用户以为在用 GPU，实际跑的是 CPU。
+MLX_MODELS = frozenset({"belle-turbo-zh"})
+MLX_MODEL_DIRS = {"belle-turbo-zh": "belle-turbo-zh-8bit"}
+# 下载优先走本仓库 Release（GitHub 直连比 HF 镜像稳），失败退回 HF + 本地转换
+MLX_RELEASE_URLS = {
+    "belle-turbo-zh": (
+        "https://github.com/Zihan9606/video-to-note/releases/download/"
+        "models-mlx/belle-turbo-zh-8bit-mlx.zip"
+    ),
+}
+MLX_SOURCE_REPOS = {
+    "belle-turbo-zh": "mlx-community/belle-whisper-large-v3-turbo-zh-8bit",
+}
+MLX_MODEL_FILES = ("weights.safetensors", "config.json")
+MLX_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "preprocessor_config.json",
+    "normalizer.json",
+)
+
+
+def is_apple_silicon() -> bool:
+    """MLX 只在 Apple Silicon + macOS 上可用（Intel Mac 走 CPU）。"""
+    return platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"}
+
+
+def mlx_supported(model_name: str, *, apple_silicon: bool | None = None) -> bool:
+    """某档位在这台机器上能否走 M 系加速。界面与后端校验共用这一个判据，
+    免得"界面能选、后端却报错"或反过来。"""
+    if apple_silicon is None:
+        apple_silicon = is_apple_silicon()
+    return bool(apple_silicon) and model_name in MLX_MODELS
+
+
+def _ensure_ffmpeg_on_path() -> None:
+    """mlx_whisper 解码音频要调 ffmpeg 二进制（faster-whisper 走 PyAV，不需要）。
+
+    系统没装 ffmpeg 时用 imageio-ffmpeg 自带的静态版。注意它的文件名带平台
+    后缀（`ffmpeg-macos-aarch64-v7.1`），光把目录加进 PATH 没用——mlx_whisper
+    调的是裸命令 `ffmpeg`，所以要在临时目录建一个名字对得上的符号链接。
+    只影响本进程，不动用户环境。
+    """
+    if shutil.which("ffmpeg"):
+        return
+    try:
+        import imageio_ffmpeg
+
+        source = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        return
+    if not source.is_file():
+        return
+    link_dir = Path(tempfile.gettempdir()) / "video-to-note-ffmpeg"
+    link_dir.mkdir(parents=True, exist_ok=True)
+    link = link_dir / "ffmpeg"
+    if link.is_symlink() or link.exists():
+        try:
+            if link.resolve() != source.resolve():
+                link.unlink()
+                link.symlink_to(source)
+        except OSError:
+            pass
+    else:
+        try:
+            link.symlink_to(source)
+            link.chmod(0o755)
+        except OSError:
+            return
+    os.environ["PATH"] = str(link_dir) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _mlx_dimensions(config: dict[str, Any]) -> dict[str, Any]:
+    """transformers 的 whisper config → mlx-whisper 的 ModelDimensions 字段。
+
+    mlx-whisper 的 load_model 会把 config 直接 `ModelDimensions(**config)`，
+    多一个字段就 TypeError；权重侧只认这 11 个维度 + quantization。
+    """
+    return {
+        "model_type": "whisper",
+        "n_audio_ctx": config["max_source_positions"],
+        "n_audio_state": config["d_model"],
+        "n_audio_head": config["encoder_attention_heads"],
+        "n_audio_layer": config["encoder_layers"],
+        "n_text_ctx": config["max_target_positions"],
+        "n_text_head": config["decoder_attention_heads"],
+        "n_text_layer": config["decoder_layers"],
+        # whisper 约定 ffn_dim = 4 * d_model；belle-turbo 实测 5120/4 = 1280 与
+        # d_model 吻合，权重 shape 也按这个对得上
+        "n_text_state": config["decoder_ffn_dim"] // 4,
+        "n_mels": config["num_mel_bins"],
+        "n_vocab": config["vocab_size"],
+        # 只留 bits/group_size：mlx 的 nn.quantize 不认 transformers 的 mode 字段
+        "quantization": {"bits": 8, "group_size": 64},
+    }
+
 # 词表文件名不能按"官方仓 .txt / 社区仓 .json"区分：同一个 Systran 官方仓里
 # tiny/base/small/medium 是 vocabulary.txt，large-v3 却是 vocabulary.json
 # （按 .txt 去下 large-v3 会 404，用户照页面下载 .json 手动导入又被判不完整）。
@@ -86,7 +203,9 @@ class TranscriptionCancelledError(Exception):
 class WhisperTranscriber:
     """Lazy faster-whisper wrapper with CPU-safe defaults."""
 
-    def __init__(self, download_root: Path | None = None) -> None:
+    def __init__(
+        self, download_root: Path | None = None, mlx_root: Path | None = None
+    ) -> None:
         self._models: dict[tuple[str, str], Any] = {}
         self._actual_models: dict[tuple[str, str], str] = {}
         self._last_download_error: Exception | None = None
@@ -97,6 +216,11 @@ class WhisperTranscriber:
         self.download_root = download_root.resolve() if download_root else None
         if self.download_root:
             self.download_root.mkdir(parents=True, exist_ok=True)
+        # MLX 权重单独放（与 CT2 的 download_root 分开：两边文件布局完全不同，
+        # 混在一起会让"缺哪些文件"的判断互相干扰）
+        self.mlx_root = mlx_root.resolve() if mlx_root else None
+        if self.mlx_root:
+            self.mlx_root.mkdir(parents=True, exist_ok=True)
 
     async def transcribe(
         self,
@@ -144,6 +268,21 @@ class WhisperTranscriber:
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+        # Apple Silicon 勾了加速：换 MLX 路径。CTranslate2 的 pip wheel 没编
+        # Metal，faster-whisper 在这台机器上永远只能是 CPU。
+        if use_gpu and is_apple_silicon():
+            if model_name not in MLX_MODELS:
+                # 不静默降级：界面已经挡过一次，这里再拦是防 API 直接调用绕过。
+                # 降成 CPU 会让用户以为在用 GPU，跑完才发现慢了三倍。
+                raise RuntimeError(
+                    f"「{model_name}」没有可用的 M 系加速权重（当前支持："
+                    f"{'、'.join(sorted(MLX_MODELS))}）。请取消勾选加速，或换用支持的档位。"
+                )
+            return self._transcribe_mlx(
+                media_path, model_name, initial_prompt, cancel_event, progress_callback
+            )
+
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
@@ -241,6 +380,180 @@ class WhisperTranscriber:
             initial_prompt=initial_prompt,
             word_timestamps=False,
         )
+
+    # ------------------------------------------------------------------
+    # Apple Silicon GPU 路径（MLX）
+    # ------------------------------------------------------------------
+
+    def _ensure_mlx_model(
+        self, model_name: str, cancel_event: threading.Event | None = None
+    ) -> Path:
+        """确保 MLX 权重在本地就位，返回模型目录。
+
+        与其他模型同一套心智：本地有就直接用，没有就下载。下载优先取本仓库
+        Release 的成品包（免得每个用户自己转换一遍），失败才退回 HF 源 +
+        本地转换——转换是一次性的，结果就落在同一目录，下次不再付这笔代价。
+        """
+        if not self.mlx_root:
+            raise RuntimeError("未配置 MLX 模型目录，无法使用 M 系加速")
+        directory = self.mlx_root / MLX_MODEL_DIRS[model_name]
+        if all((directory / name).is_file() for name in MLX_MODEL_FILES):
+            return directory
+
+        release_url = MLX_RELEASE_URLS.get(model_name)
+        if release_url:
+            try:
+                self._download_mlx_release(release_url, directory, cancel_event)
+                return directory
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.warning("MLX 模型 Release 下载失败，改走 HF 转换：%s", exc)
+
+        self._convert_mlx_from_hf(model_name, directory, cancel_event)
+        if not all((directory / name).is_file() for name in MLX_MODEL_FILES):
+            raise RuntimeError(
+                f"MLX 模型 {model_name} 准备失败：Release 和 HF 两条路都没拿到可用权重。"
+                f"可以手动把 {'、'.join(MLX_MODEL_FILES)} 放进 {directory}。"
+            )
+        return directory
+
+    def _download_mlx_release(
+        self, url: str, directory: Path, cancel_event: threading.Event | None
+    ) -> None:
+        """下载 Release 的成品 zip 并解压到模型目录。
+
+        zip 里包了一层同名目录（打包时 `zip -r ... <目录>/`），解压到 mlx_root
+        就正好落在 directory，无需再搬一次。
+        """
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        archive = directory.parent / f"{directory.name}.zip"
+        ok, error = download_to_file(
+            url,
+            archive,
+            headers={"User-Agent": "video-to-note"},
+            cancel_event=cancel_event,
+            attempts=3,
+            timeout=120,
+        )
+        if not ok:
+            raise RuntimeError(f"Release 下载失败：{error}")
+        import zipfile
+
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(directory.parent)
+        archive.unlink(missing_ok=True)
+        if not all((directory / name).is_file() for name in MLX_MODEL_FILES):
+            raise RuntimeError("Release 包里没有可用的模型文件")
+
+    def _convert_mlx_from_hf(
+        self, model_name: str, directory: Path, cancel_event: threading.Event | None
+    ) -> None:
+        """从 HF 拉社区转好的 MLX 权重，补上 mlx-whisper 认的 config 与文件名。
+
+        社区那份权重本身已是 MLX 命名 + 8bit 量化（1052 个 tensor 全是
+        encoder./decoder. 风格），但 config 仍是 transformers 的 43 个字段、
+        文件名是 model.safetensors（分片）。mlx-whisper 只认 11 个维度字段的
+        config 和单文件 weights.safetensors，直接加载会报
+        `ModelDimensions.__init__() got an unexpected keyword`。
+        所以这里只做"重写 config + 合并分片"，权重数值一个字节都不动。
+        """
+        try:
+            import mlx.core as mx
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise RuntimeError(
+                "准备 MLX 模型需要 mlx-whisper 与 huggingface-hub：`pip install mlx-whisper`"
+            ) from exc
+
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        source = Path(snapshot_download(repo_id=MLX_SOURCE_REPOS[model_name]))
+
+        merged: dict[str, Any] = {}
+        index_path = source / "model.safetensors.index.json"
+        if index_path.is_file():
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            shards = sorted(set(index["weight_map"].values()))
+        else:
+            shards = ["model.safetensors"]
+        for shard in shards:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TranscriptionCancelledError()
+            merged.update(mx.load(str(source / shard)))
+
+        config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+        directory.mkdir(parents=True, exist_ok=True)
+        mx.save_safetensors(str(directory / "weights.safetensors"), merged)
+        (directory / "config.json").write_text(
+            json.dumps(_mlx_dimensions(config), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for name in MLX_TOKENIZER_FILES:
+            candidate = source / name
+            if candidate.is_file():
+                shutil.copyfile(candidate, directory / name)
+
+    def _transcribe_mlx(
+        self,
+        media_path: Path,
+        model_name: str,
+        initial_prompt: str | None,
+        cancel_event: threading.Event | None = None,
+        progress_callback: Callable[[float, float], None] | None = None,
+    ) -> dict:
+        try:
+            import mlx_whisper
+        except ImportError as exc:
+            raise RuntimeError(
+                "M 系加速需要 mlx-whisper：`pip install mlx-whisper`"
+            ) from exc
+
+        _ensure_ffmpeg_on_path()
+        model_dir = self._ensure_mlx_model(model_name, cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelledError()
+
+        started = time.monotonic()
+        # mlx-whisper 没有逐段回调，转写期间既给不了心跳，也**不能中途取消**
+        # ——这是它的能力边界，如实写进 fallback_note，不假装能取消。
+        result = mlx_whisper.transcribe(
+            str(media_path),
+            path_or_hf_repo=str(model_dir),
+            initial_prompt=initial_prompt,
+            temperature=0.0,
+            verbose=False,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelledError()
+
+        segments = [
+            TranscriptSegment(
+                float(item["start"]), float(item["end"]), str(item.get("text") or "").strip()
+            )
+            for item in (result.get("segments") or [])
+            if str(item.get("text") or "").strip()
+        ]
+        duration = float(result.get("duration") or 0)
+        if progress_callback is not None and duration:
+            progress_callback(duration, duration)
+        return {
+            "text": " ".join(item.text for item in segments),
+            "segments": segments,
+            "language": result.get("language") or "unknown",
+            "language_probability": float(result.get("language_probability") or 0.0),
+            "device": "metal",
+            "model": model_name,
+            "requested_model": model_name,
+            "duration": duration,
+            "duration_after_vad": duration,
+            "fallback_note": (
+                "M 系加速（Metal）：转写期间不显示逐段进度，也不能中途打断"
+                "（mlx-whisper 的能力边界）；取消会在这一段转写结束后立即生效。"
+            ),
+            "model_load_seconds": 0.0,
+            "transcribe_seconds": round(time.monotonic() - started, 1),
+        }
 
     def _ensure_model(
         self,
@@ -515,6 +828,21 @@ class WhisperTranscriber:
             if self._snapshot_complete(snapshot, required_files):
                 return snapshot.resolve()
         return None
+
+    def mlx_cache_status(self, model_name: str) -> str:
+        """MLX 权重的本地状态，口径与 `_model_cache_status` 一致。
+
+        多一个 unsupported：这台机器不支持加速、或该档位没有 MLX 权重时，
+        界面要能明确区分"没下过"和"根本不支持"。
+        """
+        if not mlx_supported(model_name) or not self.mlx_root:
+            return "unsupported"
+        directory = self.mlx_root / MLX_MODEL_DIRS[model_name]
+        if all((directory / name).is_file() for name in MLX_MODEL_FILES):
+            return "cached"
+        if directory.is_dir() and any(directory.iterdir()):
+            return "incomplete"
+        return "missing"
 
     def _model_cache_status(self, model_name: str) -> str:
         """模型缓存状态：cached（完整）/ incomplete（部分或损坏文件）/ missing（无）。"""

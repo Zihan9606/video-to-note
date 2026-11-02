@@ -60,6 +60,7 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
 | 关注点 | Windows | macOS | 其他 |
 |---|---|---|---|
 | 本机密钥加密 | DPAPI（`dpapi-cryptprotect-v1`） | 钥匙串（`keychain-aesgcm-v1`） | 明文回退 |
+| GPU 加速 | CUDA（`use_gpu` → device=cuda） | **MLX / Metal**（`use_gpu` → device=metal，仅 `MLX_MODELS` 名单内的档位） | CPU int8 |
 | 启停脚本 | `start.ps1` / `stop.ps1` | `start.sh` / `stop.sh` | 用 `start.sh` |
 | 打包 | `scripts/build_exe.ps1` → 便携 exe | `scripts/build_app.sh` → `.app`（菜单栏托盘） | 无 |
 | 浏览器扫码登录 | Edge / Chrome（CDP） | Chrome / Edge，缺了退回 Safari（safaridriver） | Chrome / Edge |
@@ -97,6 +98,14 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
 - **改 `_harvest` 时注意时序**：Playwright 的 `response` 回调在 `evaluate` 期间才 flush，
   所以"先读接口、再读 DOM"会让接口数据总是晚一拍，条目被 DOM 的残缺版本占位后再也补不回来
   （实测表现为 97 条全部丢失时长）。末尾必须再吸收一次接口并按字段合并。
+- **M 系加速（MLX）**：`use_gpu` 在 Apple Silicon 上走 MLX（device=metal），与 CUDA 路径互不相干。
+  加新档位时**必须同时更新 `MLX_MODELS`**——界面和后端共用 `mlx_supported()` 这一个判据，
+  名单外的档位后端会直接报错而不是降级成 CPU（静默降级会让用户以为在用 GPU）。
+  权重首次使用自动下载：优先本仓库 Release 包（`MLX_RELEASE_URLS`），失败退回 HF +
+  `_convert_mlx_from_hf` 本地转换——转换只重写 config 与合并分片，权重数值一个字节都不动。
+  另外 `mlx_whisper` 解码音频要 ffmpeg 二进制（faster-whisper 走 PyAV 所以原本不需要），
+  `_ensure_ffmpeg_on_path` 会给 imageio-ffmpeg 的静态版在临时目录建 `ffmpeg` 符号链接
+  （它的原文件名带平台后缀，光加 PATH 找不到）。
 
 ## 相关文档
 

@@ -16,3 +16,7 @@ websockets>=13,<16
 cryptography>=42,<52
 # 页面抓取路线用它开真实浏览器（首次需 `.venv/bin/python -m playwright install chromium`）
 playwright>=1.45,<2
+# M 系芯片加速（Apple Silicon 的 GPU）：mlx 只在 macOS 上可用，非 macOS 用环境标记排除
+mlx-whisper>=0.4,<1; sys_platform == "darwin"
+# mlx_whisper 解码音频要 ffmpeg 二进制；系统没装时用它自带的静态版
+imageio-ffmpeg>=0.5,<1; sys_platform == "darwin"

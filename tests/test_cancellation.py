@@ -354,3 +354,79 @@ async def test_transcript_files_are_written_atomically(tmp_path, monkeypatch) ->
     assert not (task_dir / "transcript.md.tmp").exists()
     payload = json.loads((task_dir / "transcript.json").read_text(encoding="utf-8"))
     assert payload["segments"][0]["text"] == "测试内容"
+
+
+@pytest.mark.asyncio
+async def test_page_transcripts_survive_a_restart(tmp_path, monkeypatch) -> None:
+    """每个分 P 的转录结果必须落盘，且能从**上次的任务目录**读回来。
+
+    多分 P 中断后的续传全靠它：续传会新建任务目录（task、task_2、task_3…），
+    只在新目录里找等于没找到，用户看到的就是「明明转到 P14 了，一点续传又从 P1 开始」。
+    """
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    old_task, new_task = "task-old", "task-new"
+    (tmp_path / old_task).mkdir()
+    (tmp_path / new_task).mkdir()
+
+    await main.save_page_transcript(
+        old_task,
+        14,
+        {
+            "segments": [
+                TranscriptSegment(0.0, 3.5, "第十四讲开头"),
+                TranscriptSegment(3.5, 9.0, "第二段"),
+            ],
+            "language": "zh",
+            "model": "base",
+            "requested_model": "base",
+            "device": "cpu",
+            "duration": 9.0,
+        },
+    )
+
+    # 续传的新目录里一无所有，但旧目录里有成果
+    assert not (tmp_path / new_task / "whisper_p014.json").exists()
+    loaded = main.load_page_transcript(new_task, old_task, 14)
+    assert loaded is not None
+    assert len(loaded["segments"]) == 2
+    assert loaded["segments"][0].text == "第十四讲开头"
+    assert loaded["language"] == "zh"
+    assert loaded["device"] == "cpu"
+
+    # 没转过的分 P 仍然是 None，不能被当成"已完成"跳过
+    assert main.load_page_transcript(new_task, old_task, 15) is None
+
+
+@pytest.mark.asyncio
+async def test_page_transcript_rejects_empty_or_broken_files(tmp_path, monkeypatch) -> None:
+    """半截文件、空 segments 一律当作没转过。
+
+    这个文件是「已完成」的唯一凭据：读出空结果却当成已完成，会直接跳过这一讲，
+    最后合并稿里少一整讲——比重新转一遍更难被发现。
+    """
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_id = "broken"
+    (tmp_path / task_id).mkdir()
+    (tmp_path / task_id / "whisper_p003.json").write_text("{ 截断的 JSON", encoding="utf-8")
+    (tmp_path / task_id / "whisper_p004.json").write_text(
+        json.dumps({"segments": []}), encoding="utf-8"
+    )
+
+    assert main.load_page_transcript(task_id, None, 3) is None
+    assert main.load_page_transcript(task_id, None, 4) is None
+
+
+def test_find_existing_page_audio_reuses_last_run(tmp_path, monkeypatch) -> None:
+    """音频下过一遍就别再下：每讲几十 MB × 几十讲，重下是续传里最大的时间黑洞。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    old_task = "task-old"
+    (tmp_path / old_task).mkdir()
+    audio = tmp_path / old_task / "audio_p14.m4a"
+    audio.write_bytes(b"x" * 1024)
+    (tmp_path / old_task / "audio_p14.m4a.part").write_bytes(b"half-downloaded")
+
+    found = main.find_existing_page_audio("task-new", old_task, 14)
+    assert found == audio, "应复用上次的音频，而不是重新下载"
+    # 半截的 .part 不能算数，没下过的分 P 也仍要正常下载
+    assert main.find_existing_page_audio(old_task, old_task, 14) == audio
+    assert main.find_existing_page_audio("task-new", old_task, 15) is None

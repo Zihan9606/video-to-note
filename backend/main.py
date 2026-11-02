@@ -70,7 +70,12 @@ from .video_processor import (
     normalize_video_input,
 )
 from .paraformer_asr import ParaformerTranscriber
-from .whisper_asr import WhisperTranscriber
+from .whisper_asr import (
+    MLX_MODELS,
+    WhisperTranscriber,
+    is_apple_silicon,
+    mlx_supported,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -81,6 +86,11 @@ WORKSPACE_DIR = Path(
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 WHISPER_CACHE_DIR = Path(
     os.getenv("WHISPER_CACHE_DIR", str(WORKSPACE_DIR / "_model_cache"))
+).resolve()
+# M 系加速（MLX）的权重单独放：与 CT2 的文件布局完全不同，混在一起会让
+# "缺哪些文件"的判断互相干扰
+MLX_MODEL_DIR = Path(
+    os.getenv("VIDEOTONOTES_MLX_DIR", str(WORKSPACE_DIR / "_mlx_models"))
 ).resolve()
 FRONTEND_DIR = BASE_DIR / "frontend"
 APP_ICON_PATH = BASE_DIR / "sources" / "icon.png"
@@ -260,7 +270,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 
 
 video_processor = VideoProcessor(WORKSPACE_DIR)
-transcriber = WhisperTranscriber(WHISPER_CACHE_DIR)
+transcriber = WhisperTranscriber(WHISPER_CACHE_DIR, mlx_root=MLX_MODEL_DIR)
 paraformer_transcriber = ParaformerTranscriber(WHISPER_CACHE_DIR)
 
 
@@ -679,6 +689,93 @@ def load_transcript_result(task_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def page_transcript_path(task_id: str, page: int) -> Path:
+    """每 P 转录结果的落盘位置：`whisper_p014.json`。"""
+    return WORKSPACE_DIR / task_id / f"whisper_p{int(page):03d}.json"
+
+
+async def save_page_transcript(task_id: str, page: int, whisper: dict[str, Any]) -> None:
+    """每个分 P 转写完就立刻落盘，不再只留在内存里。
+
+    多分 P 是要跑几十分钟的活（几十讲 × 每讲几分钟音频），中途取消/失败是常态。
+    不落盘的话，「从断点继续」读不到任何已完成的分 P，只能整个重来——音频重下、
+    whisper 重跑，用户看到的就是「明明转到 P14 了，一点续传又从 P1 开始」。
+    """
+    payload = {
+        "page": int(page),
+        "language": whisper.get("language"),
+        "model": whisper.get("model"),
+        "requested_model": whisper.get("requested_model"),
+        "device": whisper.get("device"),
+        "duration": whisper.get("duration"),
+        "segments": [
+            segment.to_dict() for segment in (whisper.get("segments") or [])
+        ],
+    }
+    # 与 transcript.json 同样先写临时文件再改名：取消能落在任意 await 点，
+    # 半截文件会让 load 端读出空 segments，反而把"已完成"变成"没完成"。
+    await _write_atomically(
+        page_transcript_path(task_id, page),
+        (json.dumps(payload, ensure_ascii=False, indent=2),),
+    )
+
+
+def load_page_transcript(
+    task_id: str | None, resume_task_id: str | None, page: int
+) -> dict[str, Any] | None:
+    """读某个分 P 上次转好的结果，返回结构与 `run_transcription` 一致。
+
+    必须同时找**本次任务目录**和**被复用的那个任务目录**：续传会新建任务目录
+    （task、task_2、task_3…），上次的成果留在旧目录里，只找新目录就等于没找到。
+    """
+    for candidate in (task_id, resume_task_id):
+        if not candidate:
+            continue
+        path = page_transcript_path(candidate, page)
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        segments = [
+            TranscriptSegment(float(item["start"]), float(item["end"]), str(item["text"]))
+            for item in payload.get("segments", [])
+            if str(item.get("text", "")).strip()
+        ]
+        if not segments:
+            continue
+        return {
+            "segments": segments,
+            "language": payload.get("language") or "zh",
+            "model": payload.get("model") or "",
+            "requested_model": payload.get("requested_model") or "",
+            "device": payload.get("device") or "",
+            "duration": payload.get("duration"),
+        }
+    return None
+
+
+def find_existing_page_audio(
+    task_id: str | None, resume_task_id: str | None, page: int
+) -> Path | None:
+    """某个分 P 的音频已经下过就直接用，别再下一遍（每讲几十 MB）。"""
+    for candidate in (task_id, resume_task_id):
+        if not candidate:
+            continue
+        directory = WORKSPACE_DIR / candidate
+        if not directory.is_dir():
+            continue
+        matches = [
+            item
+            for item in directory.glob(f"audio_p{int(page)}.*")
+            if item.suffix not in {".part", ".ytdl"}
+        ]
+        if matches:
+            return max(matches, key=lambda item: item.stat().st_size)
+    return None
+
+
 def load_reused_video_info(
     task_dir: Path,
     transcript_result: dict[str, Any],
@@ -1000,16 +1097,40 @@ async def get_task_transcript(
 
 @app.get("/api/whisper-models")
 async def whisper_models_status() -> dict[str, Any]:
-    """返回各 Whisper 模型在本机的缓存状态（供前端标注下拉框）。"""
+    """返回各 Whisper 模型在本机的缓存状态（供前端标注下拉框）。
+
+    `mlx` 是 M 系加速那一侧的信息：`supported` 列出能在核显上跑的档位，
+    界面据此把其余档位禁用——不然用户选了加速 + 不支持的档位，
+    要等转写开始才报错。
+    """
     models = [
         {
             "id": model_id,
             "status": transcriber._model_cache_status(model_id),
+            "mlx_status": (
+                transcriber.mlx_cache_status(model_id) if model_id in MLX_MODELS else "unsupported"
+            ),
         }
         for model_id in sorted(WHISPER_MODELS)
     ]
-    models.append({"id": "paraformer-zh", "status": paraformer_transcriber.cache_status()})
-    return {"models": models, "manual_dir": str(WHISPER_CACHE_DIR / "manual")}
+    models.append(
+        {
+            "id": "paraformer-zh",
+            "status": paraformer_transcriber.cache_status(),
+            "mlx_status": "unsupported",
+        }
+    )
+    return {
+        "models": models,
+        "manual_dir": str(WHISPER_CACHE_DIR / "manual"),
+        "mlx": {
+            "available": is_apple_silicon(),
+            "supported": sorted(MLX_MODELS) if is_apple_silicon() else [],
+            "dir": str(MLX_MODEL_DIR),
+            # 与 requirements.txt 的环境标记一致：非 macOS 上 mlx 装不上
+            "installed": mlx_supported("belle-turbo-zh"),
+        },
+    }
 
 
 class WhisperManualFolderPayload(BaseModel):
@@ -1936,18 +2057,36 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                 whisper_by_page = {}
                 for page in bili_pages_to_transcribe:
                     raise_if_cancel_requested(task)
-                    set_progress(
-                        task, 3, "准备音频", 25, f"正在下载分 P {page.page} 音频"
+                    # 上次已经转好的分 P 直接复用——续传的价值全在这里。
+                    # 少重跑一讲是一讲：每讲几分钟音频，whisper 跑一遍要好几分钟。
+                    reused = load_page_transcript(task_id, resume_task_id, page.page)
+                    if reused:
+                        whisper_by_page[page.page] = reused
+                        task["logs"].append(
+                            f"复用分 P {page.page} 的转录：{len(reused['segments'])} 段"
+                        )
+                        continue
+
+                    media_path = find_existing_page_audio(
+                        task_id, resume_task_id, page.page
                     )
-                    media_path = await video_processor.download_audio(
-                        bilibili_page_url(source_url or "", page.page),
-                        task_id,
-                        cookie,
-                        media_name=f"audio_p{page.page}",
-                        should_abort=should_abort,
-                        notes=fallback_notes,
-                    )
-                    note_api_fallback()
+                    if media_path:
+                        task["logs"].append(
+                            f"分 P {page.page} 音频已在本地，跳过下载：{media_path.name}"
+                        )
+                    else:
+                        set_progress(
+                            task, 3, "准备音频", 25, f"正在下载分 P {page.page} 音频"
+                        )
+                        media_path = await video_processor.download_audio(
+                            bilibili_page_url(source_url or "", page.page),
+                            task_id,
+                            cookie,
+                            media_name=f"audio_p{page.page}",
+                            should_abort=should_abort,
+                            notes=fallback_notes,
+                        )
+                        note_api_fallback()
                     raise_if_cancel_requested(task)
                     set_progress(
                         task,
@@ -1967,6 +2106,8 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                         ),
                     )
                     raise_if_cancel_requested(task)
+                    # 转完一讲就落一讲的盘：中断在哪一讲都不要紧，下次续传从这里接着走
+                    await save_page_transcript(task_id, page.page, whisper_result)
                     whisper_by_page[page.page] = whisper_result
                     task["logs"].append(
                         f"分 P {page.page} 语音转写完成：{len(whisper_result['segments'])} 段，"

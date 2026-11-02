@@ -662,42 +662,8 @@ async def test_gpu_construction_failure_is_remembered(
 #
 # 这一组钉的是 M 系加速的边界：CTranslate2 的 pip wheel 不含 Metal，
 # 所以加速只能换推理引擎；换引擎之后"哪些档位可用、用不了时怎么办"
-# 必须是明确的，不能静默降级成 CPU。
+# 必须是明确的，不能静默降级成 CPU。模型来源只有两级：本地 → Release。
 # ---------------------------------------------------------------------------
-
-
-def _transformers_whisper_config() -> dict:
-    """与 mlx-community 的 belle-turbo-zh 一致的关键字段（含多余字段）。"""
-    return {
-        "max_source_positions": 1500,
-        "d_model": 1280,
-        "encoder_attention_heads": 20,
-        "encoder_layers": 32,
-        "max_target_positions": 448,
-        "decoder_attention_heads": 20,
-        "decoder_layers": 4,
-        "decoder_ffn_dim": 5120,
-        "num_mel_bins": 128,
-        "vocab_size": 51866,
-        # 以下两个必须被丢掉：mlx-whisper 直接 ModelDimensions(**config)
-        "activation_dropout": 0.0,
-        "transformers_version": "4.44.0",
-    }
-
-
-def test_mlx_dimensions_maps_whisper_config() -> None:
-    dims = whisper_asr._mlx_dimensions(_transformers_whisper_config())
-    assert dims["n_text_layer"] == 4, "turbo 的解码器只有 4 层（这就是它快的原因）"
-    assert dims["n_text_state"] == 1280, "ffn_dim / 4 与 d_model 吻合"
-    assert dims["n_audio_layer"] == 32
-    assert dims["n_vocab"] == 51866
-    assert dims["quantization"] == {"bits": 8, "group_size": 64}
-    # mlx-whisper 只认这些维度字段，多一个就 TypeError
-    assert set(dims) == {
-        "model_type", "n_audio_ctx", "n_audio_head", "n_audio_layer",
-        "n_audio_state", "n_mels", "n_text_ctx", "n_text_head",
-        "n_text_layer", "n_text_state", "n_vocab", "quantization",
-    }
 
 
 def test_mlx_supported_follows_platform_and_whitelist(
@@ -741,39 +707,36 @@ def test_mlx_model_resolution_prefers_local(
         "_download_mlx_release",
         lambda url, directory, cancel_event: touched.append("release"),
     )
-    monkeypatch.setattr(
-        transcriber,
-        "_convert_mlx_from_hf",
-        lambda name, directory, cancel_event: touched.append("hf"),
-    )
 
     assert transcriber._ensure_mlx_model("belle-turbo-zh") == target
     assert touched == [], "本地已就位时不该再下载任何东西"
 
 
-def test_mlx_model_falls_back_to_hf_when_release_fails(
+def test_mlx_model_reports_manual_path_when_release_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Release 下不去就直接报错，并把手动放置路径写清楚。
+
+    模型来源只有两级（本地 → Release），不再自动退回 HF 转换：那条路要额外
+    依赖与一次 1.5G 下载，出错时也无从校验。报错必须可操作，否则用户只会
+    看到一句"下载失败"然后卡住。
+    """
     monkeypatch.setattr(whisper_asr, "is_apple_silicon", lambda: True)
     root = tmp_path / "mlx"
     transcriber = WhisperTranscriber(tmp_path / "models", mlx_root=root)
-    converted: list[str] = []
 
     def fake_release(url, directory, cancel_event):
         raise RuntimeError("404")
 
-    def fake_convert(name, directory, cancel_event):
-        converted.append(name)
-        directory.mkdir(parents=True, exist_ok=True)
-        for filename in whisper_asr.MLX_MODEL_FILES:
-            (directory / filename).write_text("{}", encoding="utf-8")
-
     monkeypatch.setattr(transcriber, "_download_mlx_release", fake_release)
-    monkeypatch.setattr(transcriber, "_convert_mlx_from_hf", fake_convert)
 
-    resolved = transcriber._ensure_mlx_model("belle-turbo-zh")
-    assert converted == ["belle-turbo-zh"], "Release 下不去必须退回 HF 转换"
-    assert resolved.is_dir()
+    with pytest.raises(RuntimeError) as excinfo:
+        transcriber._ensure_mlx_model("belle-turbo-zh")
+
+    message = str(excinfo.value)
+    assert "手动下载" in message
+    assert whisper_asr.MLX_RELEASE_URLS["belle-turbo-zh"] in message, "要给出可复制的地址"
+    assert str(root / whisper_asr.MLX_MODEL_DIRS["belle-turbo-zh"]) in message, "要给出放置目录"
 
 
 def test_mlx_cache_status_distinguishes_unsupported(

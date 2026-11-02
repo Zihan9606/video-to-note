@@ -75,27 +75,14 @@ MODEL_REQUIRED_FILES = {
 # 否则用户以为在用 GPU，实际跑的是 CPU。
 MLX_MODELS = frozenset({"belle-turbo-zh"})
 MLX_MODEL_DIRS = {"belle-turbo-zh": "belle-turbo-zh-8bit"}
-# 下载优先走本仓库 Release（GitHub 直连比 HF 镜像稳），失败退回 HF + 本地转换
+# 下载走本仓库 Release 的成品包（免得每个用户自己转换一遍）
 MLX_RELEASE_URLS = {
     "belle-turbo-zh": (
         "https://github.com/Zihan9606/video-to-note/releases/download/"
         "models-mlx/belle-turbo-zh-8bit-mlx.zip"
     ),
 }
-MLX_SOURCE_REPOS = {
-    "belle-turbo-zh": "mlx-community/belle-whisper-large-v3-turbo-zh-8bit",
-}
 MLX_MODEL_FILES = ("weights.safetensors", "config.json")
-MLX_TOKENIZER_FILES = (
-    "tokenizer.json",
-    "vocab.json",
-    "merges.txt",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
-    "preprocessor_config.json",
-    "normalizer.json",
-)
 
 
 def is_apple_silicon() -> bool:
@@ -147,30 +134,6 @@ def _ensure_ffmpeg_on_path() -> None:
             return
     os.environ["PATH"] = str(link_dir) + os.pathsep + os.environ.get("PATH", "")
 
-
-def _mlx_dimensions(config: dict[str, Any]) -> dict[str, Any]:
-    """transformers 的 whisper config → mlx-whisper 的 ModelDimensions 字段。
-
-    mlx-whisper 的 load_model 会把 config 直接 `ModelDimensions(**config)`，
-    多一个字段就 TypeError；权重侧只认这 11 个维度 + quantization。
-    """
-    return {
-        "model_type": "whisper",
-        "n_audio_ctx": config["max_source_positions"],
-        "n_audio_state": config["d_model"],
-        "n_audio_head": config["encoder_attention_heads"],
-        "n_audio_layer": config["encoder_layers"],
-        "n_text_ctx": config["max_target_positions"],
-        "n_text_head": config["decoder_attention_heads"],
-        "n_text_layer": config["decoder_layers"],
-        # whisper 约定 ffn_dim = 4 * d_model；belle-turbo 实测 5120/4 = 1280 与
-        # d_model 吻合，权重 shape 也按这个对得上
-        "n_text_state": config["decoder_ffn_dim"] // 4,
-        "n_mels": config["num_mel_bins"],
-        "n_vocab": config["vocab_size"],
-        # 只留 bits/group_size：mlx 的 nn.quantize 不认 transformers 的 mode 字段
-        "quantization": {"bits": 8, "group_size": 64},
-    }
 
 # 词表文件名不能按"官方仓 .txt / 社区仓 .json"区分：同一个 Systran 官方仓里
 # tiny/base/small/medium 是 vocabulary.txt，large-v3 却是 vocabulary.json
@@ -390,9 +353,10 @@ class WhisperTranscriber:
     ) -> Path:
         """确保 MLX 权重在本地就位，返回模型目录。
 
-        与其他模型同一套心智：本地有就直接用，没有就下载。下载优先取本仓库
-        Release 的成品包（免得每个用户自己转换一遍），失败才退回 HF 源 +
-        本地转换——转换是一次性的，结果就落在同一目录，下次不再付这笔代价。
+        只有两级来源：本地已就位就直接用（零请求），否则下载本仓库 Release 的
+        成品包。**不再自动退回 HF 转换**——转换要额外依赖一次 1.5G 下载和一整套
+        重写逻辑，出错时也无从校验；下载失败就给出可操作的手动放置路径，
+        让用户自己决定要不要绕这一下。
         """
         if not self.mlx_root:
             raise RuntimeError("未配置 MLX 模型目录，无法使用 M 系加速")
@@ -401,20 +365,21 @@ class WhisperTranscriber:
             return directory
 
         release_url = MLX_RELEASE_URLS.get(model_name)
-        if release_url:
-            try:
-                self._download_mlx_release(release_url, directory, cancel_event)
-                return directory
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOGGER.warning("MLX 模型 Release 下载失败，改走 HF 转换：%s", exc)
-
-        self._convert_mlx_from_hf(model_name, directory, cancel_event)
+        if not release_url:
+            raise RuntimeError(f"「{model_name}」没有配置 M 系加速权重的下载地址。")
+        try:
+            self._download_mlx_release(release_url, directory, cancel_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"MLX 模型 {model_name} 下载失败：{exc}\n"
+                f"可以手动下载 {release_url}，把解压出的目录放到 {directory}"
+            ) from exc
         if not all((directory / name).is_file() for name in MLX_MODEL_FILES):
             raise RuntimeError(
-                f"MLX 模型 {model_name} 准备失败：Release 和 HF 两条路都没拿到可用权重。"
-                f"可以手动把 {'、'.join(MLX_MODEL_FILES)} 放进 {directory}。"
+                f"MLX 模型 {model_name} 下载完成但文件不齐"
+                f"（需要 {'、'.join(MLX_MODEL_FILES)}），请重新下载或手动放置到 {directory}"
             )
         return directory
 
@@ -445,54 +410,6 @@ class WhisperTranscriber:
         archive.unlink(missing_ok=True)
         if not all((directory / name).is_file() for name in MLX_MODEL_FILES):
             raise RuntimeError("Release 包里没有可用的模型文件")
-
-    def _convert_mlx_from_hf(
-        self, model_name: str, directory: Path, cancel_event: threading.Event | None
-    ) -> None:
-        """从 HF 拉社区转好的 MLX 权重，补上 mlx-whisper 认的 config 与文件名。
-
-        社区那份权重本身已是 MLX 命名 + 8bit 量化（1052 个 tensor 全是
-        encoder./decoder. 风格），但 config 仍是 transformers 的 43 个字段、
-        文件名是 model.safetensors（分片）。mlx-whisper 只认 11 个维度字段的
-        config 和单文件 weights.safetensors，直接加载会报
-        `ModelDimensions.__init__() got an unexpected keyword`。
-        所以这里只做"重写 config + 合并分片"，权重数值一个字节都不动。
-        """
-        try:
-            import mlx.core as mx
-            from huggingface_hub import snapshot_download
-        except ImportError as exc:
-            raise RuntimeError(
-                "准备 MLX 模型需要 mlx-whisper 与 huggingface-hub：`pip install mlx-whisper`"
-            ) from exc
-
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-        source = Path(snapshot_download(repo_id=MLX_SOURCE_REPOS[model_name]))
-
-        merged: dict[str, Any] = {}
-        index_path = source / "model.safetensors.index.json"
-        if index_path.is_file():
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-            shards = sorted(set(index["weight_map"].values()))
-        else:
-            shards = ["model.safetensors"]
-        for shard in shards:
-            if cancel_event is not None and cancel_event.is_set():
-                raise TranscriptionCancelledError()
-            merged.update(mx.load(str(source / shard)))
-
-        config = json.loads((source / "config.json").read_text(encoding="utf-8"))
-        directory.mkdir(parents=True, exist_ok=True)
-        mx.save_safetensors(str(directory / "weights.safetensors"), merged)
-        (directory / "config.json").write_text(
-            json.dumps(_mlx_dimensions(config), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        for name in MLX_TOKENIZER_FILES:
-            candidate = source / name
-            if candidate.is_file():
-                shutil.copyfile(candidate, directory / name)
 
     def _transcribe_mlx(
         self,

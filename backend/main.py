@@ -5,6 +5,7 @@ import importlib.util
 import io
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
@@ -79,6 +80,8 @@ from .whisper_asr import (
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+LOGGER = logging.getLogger(__name__)
 load_dotenv(BASE_DIR / ".env")
 WORKSPACE_DIR = Path(
     os.getenv("VIDEOTONOTES_WORKSPACE", str(BASE_DIR / "workspace"))
@@ -583,8 +586,17 @@ def persist_task_runtime(task_id: str) -> None:
         "result": result_metadata,
     }
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        # 写盘失败（磁盘满、目录只读）绝不能往上抛：调用方有一批是"写盘之后还要
+        # 做动作"的顺序——cancel_task 就是 persist 完才 job.cancel()，异常冒上去
+        # 会让取消根本没发出，任务永远停在"取消中"（实测 Errno 28 就是这么来的）。
+        # 半截 .tmp 也一并清掉，否则它会留在目录里被当成残留产物。
+        LOGGER.warning("任务状态写盘失败（%s）：%s", exc, path)
+        temporary.unlink(missing_ok=True)
+        return
 
 
 def raise_if_cancel_requested(task: dict[str, Any]) -> None:
@@ -694,6 +706,39 @@ def page_transcript_path(task_id: str, page: int) -> Path:
     return WORKSPACE_DIR / task_id / f"whisper_p{int(page):03d}.json"
 
 
+def resume_chain(resume_task_id: str | None, *, limit: int = 32) -> list[str]:
+    """从续传起点沿 `reused_task_id` 链向上收集目录名（起点在最前）。
+
+    续传的产物是**分散**的：每次续传都新建目录，而某个分 P 只会落在"实际
+    转写它的那一次"的目录里——P1..P10 在最初那次、P11 在第二次、P12 的
+    音频在第三次。只查被 resume 的那一个目录，会把祖先目录里已完成的分 P
+    当成"从没转过"，用户看到的就是"明明完成了 P11，一点续传又从 P1 开始"。
+    """
+    chain: list[str] = []
+    seen: set[str] = set()
+    current = resume_task_id
+    while current and current not in seen and len(chain) < limit:
+        seen.add(current)
+        chain.append(current)
+        try:
+            manifest = json.loads(
+                (WORKSPACE_DIR / current / "task.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            break
+        current = manifest.get("reused_task_id") or None
+    return chain
+
+
+def _resume_candidates(task_id: str | None, resume_task_id: str | None) -> list[str]:
+    """本次任务自己的目录 + 续传链上的全部祖先目录（去重，保持顺序）。"""
+    candidates: list[str] = []
+    for candidate in [task_id, *resume_chain(resume_task_id)]:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 async def save_page_transcript(task_id: str, page: int, whisper: dict[str, Any]) -> None:
     """每个分 P 转写完就立刻落盘，不再只留在内存里。
 
@@ -725,12 +770,10 @@ def load_page_transcript(
 ) -> dict[str, Any] | None:
     """读某个分 P 上次转好的结果，返回结构与 `run_transcription` 一致。
 
-    必须同时找**本次任务目录**和**被复用的那个任务目录**：续传会新建任务目录
-    （task、task_2、task_3…），上次的成果留在旧目录里，只找新目录就等于没找到。
+    沿续传链（本目录 → 被复用的目录 → 它被复用的目录 …）逐个找：产物散在
+    祖先目录里，只看一个目录会把已完成的分 P 当成没转过。
     """
-    for candidate in (task_id, resume_task_id):
-        if not candidate:
-            continue
+    for candidate in _resume_candidates(task_id, resume_task_id):
         path = page_transcript_path(candidate, page)
         if not path.is_file():
             continue
@@ -759,10 +802,11 @@ def load_page_transcript(
 def find_existing_page_audio(
     task_id: str | None, resume_task_id: str | None, page: int
 ) -> Path | None:
-    """某个分 P 的音频已经下过就直接用，别再下一遍（每讲几十 MB）。"""
-    for candidate in (task_id, resume_task_id):
-        if not candidate:
-            continue
+    """某个分 P 的音频已经下过就直接用，别再下一遍（每讲几十 MB）。
+
+    同样沿续传链找：音频散在各代目录里（P1..P11 在最初那次、P12 在第三次）。
+    """
+    for candidate in _resume_candidates(task_id, resume_task_id):
         directory = WORKSPACE_DIR / candidate
         if not directory.is_dir():
             continue
@@ -1809,15 +1853,17 @@ async def cancel_task(task_id: str) -> dict[str, Any]:
         cancel_event.set()
     task.update(status="cancelling", step_name="取消中", error=None)
     task["logs"].append("已收到取消请求；正在尽快停止当前步骤")
-    persist_task_runtime(task_id)
     if first_request:
         # 取消的唯一收口：直接掐掉 asyncio 任务，让 CancelledError 落在当前 await 点。
         # should_abort / cancel_event 只是让后台线程早点收工的优化，新增阶段忘了接线
         # 也不会再让取消"失效"（v1.2.3 的 412 回退把没接线的读取信息/查找字幕阶段
         # 拉长，表现为取消不动）。这一句之后不能再有 await，否则会覆盖处理器写的终态。
+        # 先取消再写盘：写盘只是记录，动作本身不能排在它后面（写盘失败会把它吞掉）。
         job = running_jobs.get(task_id)
         if job is not None and not job.done():
             job.cancel()
+    # persist 放最后：它内部已经吞掉 OSError，但记录排在动作之后也更合理
+    persist_task_runtime(task_id)
     return {
         "cancelled": False,
         "status": task["status"],
@@ -2776,7 +2822,10 @@ def restore_tasks_from_workspace() -> None:
         ):
             status = "completed"
         elif interrupted:
-            status = "failed"
+            # cancelling 是用户主动取消、只是收尾状态没写进盘（当时磁盘满），
+            # 归成 failed 会让历史里出现"根本没失败却失败"的任务；真正在跑时
+            # 被重启打断的（pending/queued/processing）才算是失败中断。
+            status = "cancelled" if status == "cancelling" else "failed"
         elif status not in {"failed", "cancelled", "uploaded"}:
             status = "uploaded" if uploaded_media else "failed"
 

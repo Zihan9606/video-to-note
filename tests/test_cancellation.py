@@ -430,3 +430,139 @@ def test_find_existing_page_audio_reuses_last_run(tmp_path, monkeypatch) -> None
     # 半截的 .part 不能算数，没下过的分 P 也仍要正常下载
     assert main.find_existing_page_audio(old_task, old_task, 14) == audio
     assert main.find_existing_page_audio("task-new", old_task, 15) is None
+
+
+def test_cancel_still_cancels_job_when_status_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """磁盘写不进去时，取消也必须真正发出（否则任务永远停在"取消中"）。
+
+    实测 Errno 28（磁盘满）：persist_task_runtime 的 write_text 抛 OSError，
+    异常往上冒，`cancel_task` 在 `job.cancel()` **之前**就中断了——用户点几次
+    取消都无效，任务与界面一起卡在取消中。写盘只是记录，动作必须排在它前面。
+    """
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_id = "cancel-with-full-disk"
+    (tmp_path / task_id).mkdir(parents=True, exist_ok=True)
+    main.tasks[task_id] = main.new_task(status="processing", task_id=task_id)
+
+    cancelled = {"called": False}
+
+    class FakeJob:
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            cancelled["called"] = True
+
+    main.running_jobs[task_id] = FakeJob()
+
+    real_write_text = Path.write_text
+
+    def failing_write(self, *args, **kwargs):
+        if self.name.endswith(".json.tmp"):
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", failing_write)
+
+    try:
+        response = asyncio.run(main.cancel_task(task_id))
+    finally:
+        main.running_jobs.pop(task_id, None)
+
+    assert cancelled["called"], "写盘失败也不能吞掉 job.cancel()"
+    assert response["status"] == "cancelling"
+    assert main.tasks[task_id]["status"] == "cancelling"
+    main.tasks.pop(task_id, None)
+
+
+def test_persist_swallows_write_error_and_cleans_partial_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写状态失败时不往上抛、并清掉半截 .tmp——否则它会被当成残留产物。
+
+    调用方有一批是"写盘之后还要做动作"的顺序（取消、进队列…），
+    任何一处让 OSError 冒上去都会打断后半截动作。
+    """
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    task_id = "persist-with-full-disk"
+    (tmp_path / task_id).mkdir(parents=True, exist_ok=True)
+    main.tasks[task_id] = main.new_task(status="processing", task_id=task_id)
+
+    real_write_text = Path.write_text
+
+    def failing_write(self, *args, **kwargs):
+        if self.name.endswith(".json.tmp"):
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", failing_write)
+    try:
+        main.persist_task_runtime(task_id)  # 不该抛
+    finally:
+        main.tasks.pop(task_id, None)
+
+    assert not (tmp_path / task_id / "task.json.tmp").exists(), "半截 tmp 必须清掉"
+
+
+def _write_manifest(tmp_path: Path, task_id: str, reused: str | None = None) -> None:
+    directory = tmp_path / task_id
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {"task_id": task_id}
+    if reused:
+        payload["reused_task_id"] = reused
+    (directory / "task.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_page_transcript(tmp_path: Path, task_id: str, page: int, text: str) -> None:
+    directory = tmp_path / task_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"whisper_p{page:03d}.json").write_text(
+        json.dumps({"segments": [{"start": 0.0, "end": 1.0, "text": text}],
+                    "language": "zh"}),
+        encoding="utf-8",
+    )
+
+
+def test_resume_chain_finds_products_in_ancestor_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """产物散在祖先目录：只查被 resume 的那一个目录会把已完成的分 P 当成没转过。
+
+    实测场景（用户原话：完成了 P11 点续传，又从 P1 开始）：
+    P1..P10 的 whisper 落在最初那次任务、P11 在第二次、P12 音频在第三次，
+    新任务 resumed 的只是第二次——不沿 reused 链找就会全部重来。
+    """
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    root, second, third = "task", "task_2", "task_3"
+    _write_manifest(tmp_path, third, reused=second)
+    _write_manifest(tmp_path, second, reused=root)
+    _write_manifest(tmp_path, root)
+    _write_page_transcript(tmp_path, root, 1, "第一讲")
+    _write_page_transcript(tmp_path, second, 11, "第十一讲")
+    (tmp_path / root / "audio_p1.m4a").write_bytes(b"a" * 16)
+    (tmp_path / third / "audio_p12.m4a").write_bytes(b"b" * 16)
+
+    assert main.resume_chain(third) == [third, second, root]
+
+    # P1 只存在于最初那次的目录里，P11 在第二次——都必须沿链找到
+    first = main.load_page_transcript("brand-new", third, 1)
+    assert first is not None and first["segments"][0].text == "第一讲"
+    assert main.load_page_transcript("brand-new", third, 11) is not None
+    # P12 当时在转写中被取消，没有落盘——不能凭空算成"已完成"
+    assert main.load_page_transcript("brand-new", third, 12) is None
+
+    audio_root = main.find_existing_page_audio("brand-new", third, 1)
+    assert audio_root is not None and audio_root.parent.name == root, "祖先目录里的音频也要复用"
+    audio_local = main.find_existing_page_audio("brand-new", third, 12)
+    assert audio_local is not None and audio_local.parent.name == third
+
+
+def test_resume_chain_survives_self_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """脏数据（reused_task_id 指向自己）不能让查找死循环。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    _write_manifest(tmp_path, "loop", reused="loop")
+    assert main.resume_chain("loop") == ["loop"]

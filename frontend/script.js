@@ -118,6 +118,7 @@ const LEGACY_PROVIDER_MAP = {
     custom: 'custom'
 };
 
+// 页面加载时的初值由 rememberedTaskId() 从偏好里惰性取（prefs 这会儿还没 load）
 let currentTaskId = null;
 // 上传上限以本机后端 /api/health 下发为准；后端未就绪时按这个回退（与后端默认值一致）
 const DEFAULT_MAX_UPLOAD_MB = 2048;
@@ -129,6 +130,22 @@ let pollTimer = null;
 let pollErrorCount = 0;
 let isSubmitting = false;
 let isTaskActive = false;
+function setCurrentTaskId(taskId) {
+    currentTaskId = taskId || null;
+    // 走 persistPrefs（全文件唯一写入口，测试盯着这个约定）：任务 ID 属于
+    // 用户状态，与偏好同存；置空时字段被 sanitize 丢掉，等价于清除。
+    prefs.global = prefs.global || {};
+    if (prefs.global.current_task_id !== currentTaskId) {
+        prefs.global.current_task_id = currentTaskId;
+        persistPrefs();
+    }
+}
+
+function rememberedTaskId() {
+    if (currentTaskId) return currentTaskId;
+    currentTaskId = (prefs && prefs.global && prefs.global.current_task_id) || null;
+    return currentTaskId;
+}
 let isDownloading = false;
 let isCancelling = false;
 // 结果区当前展示的是字幕稿还是笔记：标题、按钮文案与进度步数都跟着它走
@@ -522,7 +539,7 @@ async function openRecentTask(taskId) {
         });
         const task = await readResponse(response, '读取任务失败');
         resetTaskView();
-        currentTaskId = taskId;
+        setCurrentTaskId(taskId);
         if (task.source_url) {
             byId('sourceType').value = 'url';
             byId('videoUrl').value = task.source_url;
@@ -583,7 +600,9 @@ const GLOBAL_PREF_KEYS = [
     'summary_style',
     'reasoning_effort',
     'processing_mode',
-    'output_mode'
+    'output_mode',
+    // 当前任务 ID：刷新后仍能点「从断点继续」（不加进白名单读取时会被 mergePrefs 丢掉）
+    'current_task_id'
 ];
 
 function defaultProvider() {
@@ -2331,7 +2350,9 @@ async function startSummary(options = {}) {
     flushPendingPrefs();   // 本次提交用的设置必须同步落盘，不能留在防抖里
     if (options.outputMode) setOutputMode(options.outputMode);
 
-    const resumeTaskId = options.resumeCurrent ? currentTaskId : null;
+    // resumeCurrent 走 rememberedTaskId()：即使刷新过页面、resetTaskView 清了
+    // 界面，localStorage 里还留着上次的任务，点续传不该退化成"从头开始"
+    const resumeTaskId = options.resumeCurrent ? rememberedTaskId() : null;
     const selectedMode = document.querySelector('input[name="processingMode"]:checked')?.value || 'restart';
     const forceRestart = Boolean(options.forceRestart || (!resumeTaskId && selectedMode === 'restart'));
     const request = validateAndBuildRequestBase(resumeTaskId);
@@ -2412,7 +2433,7 @@ async function startSummary(options = {}) {
         const data = await readResponse(response, '提交任务失败');
 
         if (!data.task_id) throw new Error('后端未返回任务 ID');
-        currentTaskId = data.task_id;
+        setCurrentTaskId(data.task_id);
         // 任务目录在提交那一刻就建好了，不用等跑完才能打开
         byId('openTaskFolderBtn').disabled = false;
         setTranscriptTaskView(request.transcriptOnly);
@@ -2425,7 +2446,7 @@ async function startSummary(options = {}) {
         setSubmitting(false, '处理中');
         schedulePoll(currentTaskId, 0);
     } catch (error) {
-        if (resumeTaskId) currentTaskId = resumeTaskId;
+        if (resumeTaskId) setCurrentTaskId(resumeTaskId);
         setSubmitting(false);
         failTask(error.message || '提交失败，请确认本地后端已启动');
     }
@@ -2671,6 +2692,8 @@ function resetTaskView() {
     setTaskActive(false);
     pollErrorCount = 0;
     whisperFallbackNotified = false;
+    // 只清内存里的引用：localStorage 那份要留着，否则用户清完界面点
+    // 「从断点继续」就拿不到上次的任务，又变回从头开始
     currentTaskId = null;
     currentMarkdown = '';
     currentHtml = '';

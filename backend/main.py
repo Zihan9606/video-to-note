@@ -118,7 +118,9 @@ ALLOWED_MEDIA_SUFFIXES = {
     ".webm",
     ".avi",
 }
-WHISPER_MODELS = {"tiny", "base", "small", "medium", "large-v3", "turbo", "belle-turbo-zh"}
+# large-v3 已下架：它要 128 mel、必须带 preprocessor_config.json，而下载清单
+# 一直没给它配（加载必报 expected 128 got 80）；实测核显/中文场景也轮不到它
+WHISPER_MODELS = {"tiny", "base", "small", "medium", "turbo", "belle-turbo-zh"}
 ASR_MODELS = WHISPER_MODELS | {"paraformer-zh"}
 DOUYIN_HINT = (
     "抖音链接解析失败。可以先点击“打开抖音浏览器”，在本机窗口完成登录/验证后重试；"

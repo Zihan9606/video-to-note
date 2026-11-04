@@ -306,7 +306,7 @@ agent 会调用技能附带的 `scripts/video_note.py`，自动探测服务端�
 
 ### CPU 转写为什么比视频时长还久？
 
-速度取决于 CPU、视频时长和模型大小。CPU 模式使用 `int8` 降低资源压力，但 `medium`、`large-v3` 和 `turbo` 仍可能较慢并占用较多内存。个人电脑建议先使用 `base`；确认 CUDA 环境可用后再启用 GPU。
+速度取决于 CPU、视频时长和模型大小。CPU 模式使用 `int8` 降低资源压力，但 `medium` 和 `turbo` 仍可能较慢并占用较多内存。个人电脑建议先使用 `base`；确认 CUDA 环境可用后再启用 GPU。
 
 ### macOS 上点「扫码登录导入」提示需要授权？
 

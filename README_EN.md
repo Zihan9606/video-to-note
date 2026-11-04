@@ -295,7 +295,7 @@ Downloads and cached files are verified for integrity; corrupt leftovers from in
 
 ### Why is CPU transcription slower than the video duration?
 
-Speed depends on CPU performance, media duration, and model size. CPU mode uses `int8` to reduce resource pressure, but `medium`, `large-v3`, and `turbo` can still be slow and memory-intensive. Start with `base` on a personal computer, and enable GPU mode only after confirming CUDA works correctly.
+Speed depends on CPU performance, media duration, and model size. CPU mode uses `int8` to reduce resource pressure, but `medium` and `turbo` can still be slow and memory-intensive. Start with `base` on a personal computer, and enable GPU mode only after confirming CUDA works correctly.
 
 ### Why does clicking "Import via QR login" on macOS ask for authorization?
 

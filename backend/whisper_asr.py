@@ -40,7 +40,6 @@ WHISPER_MODEL_REPOS = {
     "base": "Systran/faster-whisper-base",
     "small": "Systran/faster-whisper-small",
     "medium": "Systran/faster-whisper-medium",
-    "large-v3": "Systran/faster-whisper-large-v3",
     "turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
     "belle-turbo-zh": "wolfofbackstreet/faster-whisper-belle-whisper-large-v3-turbo-zh-ct2-int8",
 }
@@ -85,7 +84,6 @@ MLX_MODEL_DIRS = {
             ("base", "mlx-community/whisper-base-mlx"),
             ("small", "mlx-community/whisper-small-mlx"),
             ("medium", "mlx-community/whisper-medium-mlx"),
-            ("large-v3", "mlx-community/whisper-large-v3-mlx"),
         )
     },
 }
@@ -105,7 +103,6 @@ MLX_HF_REPOS = {
         ("base", "mlx-community/whisper-base-mlx"),
         ("small", "mlx-community/whisper-small-mlx"),
         ("medium", "mlx-community/whisper-medium-mlx"),
-        ("large-v3", "mlx-community/whisper-large-v3-mlx"),
     )
 }
 MLX_MODEL_FILES = ("weights.safetensors", "config.json")

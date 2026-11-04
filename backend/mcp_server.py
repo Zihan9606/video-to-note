@@ -392,7 +392,7 @@ async def summarize_video(
         base_url: 自定义 OpenAI 兼容接口地址（custom 必填）。
         summary_style: detailed=详细笔记+点评分析 / faithful=详细复原 / concise=精简摘要。
         reasoning_effort: auto（模型默认）/ off / high / max。
-        whisper_model: 无字幕时的转写模型（tiny/base/small/medium/large-v3/turbo）。
+        whisper_model: 无字幕时的转写模型（tiny/base/small/medium/turbo/belle-turbo-zh）。
         use_gpu: 是否启用 NVIDIA GPU 转写。
         include_screenshots: 是否附带定时截图。
         screenshot_interval: 截图间隔秒数（5-300）。
@@ -452,7 +452,7 @@ async def transcribe_video(
 
     Args:
         video_url: B 站 / YouTube 等视频链接，必填。
-        whisper_model: 无字幕时的本地转写模型（tiny/base/small/medium/large-v3/turbo）。
+        whisper_model: 无字幕时的本地转写模型（tiny/base/small/medium/turbo/belle-turbo-zh）。
         use_gpu: 是否启用 NVIDIA GPU 转写。
         prefer_subtitles: 优先使用平台字幕（默认开启，命中时不跑转写、几乎秒回）。
         processing_mode: reuse=复用同链接已有转录 / restart=从头处理。

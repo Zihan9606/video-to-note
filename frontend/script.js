@@ -896,6 +896,9 @@ function applyPreferencesToForm() {
     renderProfileOptions();
     renderProfileForm();
     byId('whisperModel').value = prefs.global.whisper_model;
+    // 偏好里存的档位可能已经下架（如 large-v3）：赋无效值会让 select 变成
+    // 未选中（value 为空），提交时后端直接拒——这里兜底回默认档
+    if (!byId('whisperModel').value) byId('whisperModel').value = 'base';
     snapshotWhisperLabels();
     refreshWhisperModelHints();
     byId('screenshotInterval').value = prefs.global.screenshot_interval;
@@ -2163,7 +2166,6 @@ const WHISPER_MODEL_SIZES = {
     base: '~142MB',
     small: '~466MB',
     medium: '~1.5GB',
-    'large-v3': '~3.1GB',
     turbo: '~1.6GB',
     'belle-turbo-zh': '~0.8GB',
     'paraformer-zh': '~0.5GB'

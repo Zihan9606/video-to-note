@@ -101,9 +101,16 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
 - **M 系加速（MLX）**：`use_gpu` 在 Apple Silicon 上走 MLX（device=metal），与 CUDA 路径互不相干。
   加新档位时**必须同时更新 `MLX_MODELS`**——界面和后端共用 `mlx_supported()` 这一个判据，
   名单外的档位后端会直接报错而不是降级成 CPU（静默降级会让用户以为在用 GPU）。
-  权重只有两级来源：本地 `workspace/_mlx_models/` → 本仓库 Release 包（`MLX_RELEASE_URLS`）。
-  **不再自动退回 HF 转换**——那条路要额外依赖一次 1.5G 下载和一整套重写逻辑，
-  出错时也无从校验；下载失败直接报错，并把可复制的下载地址与放置目录写进报错信息。
+  **当前名单只有 `belle-turbo-zh`**（串行实测：openai 系核显比 CPU int8 还慢，
+  且丢开头 30 秒；belle 核显 14.8s vs CPU 94.3s）。权重按档位取成品，本地已就位
+  就直接用：belle 走本仓库 Release 包（`MLX_RELEASE_URLS`，社区那份 config 是
+  transformers 格式、mlx-whisper 不认，所以自打包）；openai 系的直下映射
+  （`MLX_HF_REPOS`）仍保留，把档位加回 `MLX_MODELS` 即可启用。**不再自动退回 HF 转换**（那条路要额外依赖一次 1.5G 下载和
+  一整套重写逻辑，出错时也无从校验）；下载失败直接报错，并把可复制的下载地址与
+  放置目录写进报错信息。
+  权重文件名有两种合法格式（`mlx_model_ready` 同时认）：自打包的 belle 是
+  `weights.safetensors`，mlx-community 的 openai 系是 `weights.npz`——
+  mlx_whisper 的加载器两种都读，校验只认前者会把下好的 npz 误判成"文件不齐"。
   另外 `mlx_whisper` 解码音频要 ffmpeg 二进制（faster-whisper 走 PyAV 所以原本不需要），
   `_ensure_ffmpeg_on_path` 会给 imageio-ffmpeg 的静态版在临时目录建 `ffmpeg` 符号链接
   （它的原文件名带平台后缀，光加 PATH 找不到）。

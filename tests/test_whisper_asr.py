@@ -671,7 +671,12 @@ def test_mlx_supported_follows_platform_and_whitelist(
 ) -> None:
     monkeypatch.setattr(whisper_asr, "is_apple_silicon", lambda: True)
     assert whisper_asr.mlx_supported("belle-turbo-zh") is True
-    assert whisper_asr.mlx_supported("base") is False, "没有 MLX 权重的档位不能算支持"
+    # 串行实测：openai 系核显反而比 CPU int8 慢（base 10.3 vs 5.2 秒），
+    # 且丢了开头 30 秒——所以名单只开 belle，其余一律算不支持
+    assert whisper_asr.mlx_supported("base") is False
+    assert whisper_asr.mlx_supported("small") is False
+    # turbo 的 MLX 仓库是私有的（404/401），拿不到权重 → 必须算不支持
+    assert whisper_asr.mlx_supported("turbo") is False, "没有 MLX 权重的档位不能算支持"
     monkeypatch.setattr(whisper_asr, "is_apple_silicon", lambda: False)
     assert whisper_asr.mlx_supported("belle-turbo-zh") is False
 
@@ -686,7 +691,7 @@ def test_gpu_on_unsupported_model_raises_instead_of_using_cpu(
     monkeypatch.setattr(whisper_asr, "is_apple_silicon", lambda: True)
     transcriber = WhisperTranscriber(tmp_path / "models", mlx_root=tmp_path / "mlx")
     with pytest.raises(RuntimeError, match="没有可用的 M 系加速权重"):
-        transcriber._transcribe_sync(tmp_path / "a.wav", "small", True, None)
+        transcriber._transcribe_sync(tmp_path / "a.wav", "turbo", True, None)
 
 
 def test_mlx_model_resolution_prefers_local(
@@ -748,6 +753,7 @@ def test_mlx_cache_status_distinguishes_unsupported(
     # 没下过 ≠ 不支持：界面要能分开说
     assert transcriber.mlx_cache_status("belle-turbo-zh") == "missing"
     assert transcriber.mlx_cache_status("base") == "unsupported"
+    assert transcriber.mlx_cache_status("turbo") == "unsupported"
 
     target = root / whisper_asr.MLX_MODEL_DIRS["belle-turbo-zh"]
     target.mkdir(parents=True)
@@ -789,3 +795,72 @@ def test_ffmpeg_on_path_falls_back_to_imageio(
     assert link.is_symlink() and link.resolve() == binary.resolve()
     assert str(link_dir) in os.environ["PATH"]
     assert whisper_asr.shutil.which("ffmpeg") == str(link)
+
+
+def test_looks_like_hallucination_only_flags_narrow_repitition() -> None:
+    """幻觉判据要保守：挡住标点复读，放过真实短答。
+
+    用的是真实落盘内容（P1 片头那段）作为反例素材。
+    """
+    # 典型幻觉：无字母数字、字符集极窄的长复读
+    assert whisper_asr.looks_like_hallucination(".ALE.ALE.A.A.A.A.A.A.A.A.A.A.A.A.A.A")
+    assert whisper_asr.looks_like_hallucination("! ! ! ! !")
+    assert whisper_asr.looks_like_hallucination(".")
+    assert whisper_asr.looks_like_hallucination("   ")
+    # 真实内容：短答、正常句子都要放行（"嗯"/"Yes" 字符集窄但短）
+    assert not whisper_asr.looks_like_hallucination("Yes")
+    assert not whisper_asr.looks_like_hallucination("嗯。")
+    assert not whisper_asr.looks_like_hallucination(
+        "that these finance professors left something essential out of the whole story."
+    )
+    # 够长且字符集足够散 → 放行（避免误杀真实重复句）
+    assert not whisper_asr.looks_like_hallucination(
+        "The market stayed flat, the market stayed flat for weeks."
+    )
+
+
+def test_mlx_transcribe_passes_hallucination_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mlx 路径必须带上幻觉抑制参数，并把幻觉段滤掉。
+
+    未加抑制时同一段音频转出 1036 段几乎全是 "!"；参数缺失不是风格问题，
+    是"转录内容是乱码"的直接原因。
+    """
+    monkeypatch.setattr(whisper_asr, "is_apple_silicon", lambda: True)
+    captured: dict = {}
+
+    class FakeMlx:
+        @staticmethod
+        def transcribe(audio, **kwargs):
+            captured.update(kwargs)
+            return {
+                "text": "ok",
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "  正常的一句话  "},
+                    {"start": 1.0, "end": 2.0, "text": "! ! ! ! !"},
+                    {"start": 2.0, "end": 3.0, "text": ".ALE.A.A.A.A.A.A.A.A.A.A.A"},
+                ],
+                "language": "zh",
+                "duration": 3.0,
+            }
+
+    monkeypatch.setitem(sys.modules, "mlx_whisper", FakeMlx)
+    model_dir = tmp_path / "mlx" / whisper_asr.MLX_MODEL_DIRS["belle-turbo-zh"]
+    model_dir.mkdir(parents=True)
+    for name in whisper_asr.MLX_MODEL_FILES:
+        (model_dir / name).write_text("{}", encoding="utf-8")
+
+    transcriber = WhisperTranscriber(tmp_path / "models", mlx_root=tmp_path / "mlx")
+    result = transcriber._transcribe_mlx(tmp_path / "a.wav", "belle-turbo-zh", None)
+
+    assert captured["condition_on_previous_text"] is False, "关掉上下文传递，幻觉才不会复读"
+    # 0.6 = 官方默认；0.9 会把开头 30 秒判成静音跳掉（实测丢了第一句）
+    assert captured["no_speech_threshold"] == 0.6
+    assert captured["hallucination_silence_threshold"] == 2.0
+    assert captured["compression_ratio_threshold"] == 2.0
+    assert len(captured["temperature"]) > 1, "温度回退序列让超标段重解"
+
+    texts = [segment.text for segment in result["segments"]]
+    assert texts == ["正常的一句话"], f"幻觉段必须被滤掉，实际={texts}"
+    assert result["device"] == "metal"

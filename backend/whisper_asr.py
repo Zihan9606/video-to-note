@@ -69,20 +69,57 @@ MODEL_REQUIRED_FILES = {
 # 源码里支持，wheel 没编进去，实测 site-packages 里没有任何 metal 文件），
 # 所以 M 系芯片想用核显只能换推理引擎——这里选 Apple 官方的 MLX。
 #
-# 只有下面列出来的档位有可用的 MLX 权重（belle 那档是把社区转好的权重补上
-# mlx-whisper 认的 config 后自托管的，见 scripts/convert_mlx_model.py）。
-# 勾了"加速"却选了不在名单里的档位，界面会禁用它，后端也会拒绝——不静默降级，
-# 否则用户以为在用 GPU，实际跑的是 CPU。
+# 目前只开 belle 一档。串行实测（60 秒音频、每组独立进程）：openai 系在核显上
+# 并没有加速（base 10.3s vs CPU 5.2s、small 27.4s vs 15.2s、medium 60.2s vs
+# 41.4s——M1 的 CPU 跑 int8 更快），质量上还丢了开头 30 秒；belle 是
+# large-v3-turbo 底座，核显 14.8s vs CPU 94.3s（快 6.4 倍）才是真受益。
+# openai 系的映射仍留在 MLX_MODEL_DIRS / MLX_HF_REPOS：把档位加回本名单即可启用。
 MLX_MODELS = frozenset({"belle-turbo-zh"})
-MLX_MODEL_DIRS = {"belle-turbo-zh": "belle-turbo-zh-8bit"}
-# 下载走本仓库 Release 的成品包（免得每个用户自己转换一遍）
+# 权重目录名：belle 那档是自打包的目录，openai 系直接用 HF 仓库名做目录
+MLX_MODEL_DIRS = {
+    "belle-turbo-zh": "belle-turbo-zh-8bit",
+    **{
+        name: repo.rsplit("/", 1)[-1]
+        for name, repo in (
+            ("tiny", "mlx-community/whisper-tiny-mlx"),
+            ("base", "mlx-community/whisper-base-mlx"),
+            ("small", "mlx-community/whisper-small-mlx"),
+            ("medium", "mlx-community/whisper-medium-mlx"),
+            ("large-v3", "mlx-community/whisper-large-v3-mlx"),
+        )
+    },
+}
+# 自托管的成品包（belle 需要：社区那份 config 是 transformers 格式，mlx-whisper 不认）
 MLX_RELEASE_URLS = {
     "belle-turbo-zh": (
         "https://github.com/Zihan9606/video-to-note/releases/download/"
         "models-mlx/belle-turbo-zh-8bit-mlx.zip"
     ),
 }
+# openai 系：mlx-community 上就是 mlx-whisper 认的成品（11 字段 config +
+# weights.safetensors），**直接下、零转换**——与上面那个"自打包"是两回事
+MLX_HF_REPOS = {
+    name: repo
+    for name, repo in (
+        ("tiny", "mlx-community/whisper-tiny-mlx"),
+        ("base", "mlx-community/whisper-base-mlx"),
+        ("small", "mlx-community/whisper-small-mlx"),
+        ("medium", "mlx-community/whisper-medium-mlx"),
+        ("large-v3", "mlx-community/whisper-large-v3-mlx"),
+    )
+}
 MLX_MODEL_FILES = ("weights.safetensors", "config.json")
+# 权重有两种合法格式，mlx_whisper 的加载器都认（load_models.py 里先找
+# safetensors、没有就退回 npz）：我们自打包的 belle 是 safetensors，
+# mlx-community 的 openai 系是 npz——校验只认前者会把下好的 npz 误判成"文件不齐"
+MLX_WEIGHT_NAMES = ("weights.safetensors", "weights.npz")
+
+
+def mlx_model_ready(directory: Path) -> bool:
+    """MLX 权重目录是否就位：config 齐 + 任一格式的权重在。"""
+    return (directory / "config.json").is_file() and any(
+        (directory / name).is_file() for name in MLX_WEIGHT_NAMES
+    )
 
 
 def is_apple_silicon() -> bool:
@@ -96,6 +133,26 @@ def mlx_supported(model_name: str, *, apple_silicon: bool | None = None) -> bool
     if apple_silicon is None:
         apple_silicon = is_apple_silicon()
     return bool(apple_silicon) and model_name in MLX_MODELS
+
+
+def looks_like_hallucination(text: str) -> bool:
+    """段落文本是否是幻觉输出（纯标点、单字符、超高重复）。
+
+    mlx-whisper 没有 VAD，片头音乐/长静音会被强行解码成 `! ! !`、`.ALE.A.A.`
+    这类复读——实测同一段音频，未加抑制时 1036 段几乎全是 `!`，加抑制后 225 段
+    且正文完整。参数能挡掉大头，这里再兜一道，也给"已生成的乱码转录"留个清理口径。
+
+    判据刻意保守：只要含足够多的不同字符就放行，避免把 "Yes"、"嗯" 这类
+    真实短答误杀。
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if not any(char.isalnum() for char in stripped):
+        return True  # ". "、"!!!"、"……"
+    if len(stripped) >= 16 and len(set(stripped)) <= 6:
+        return True  # ".ALE.ALE.A.A.A…" 这种字符集极窄的复读
+    return False
 
 
 def _ensure_ffmpeg_on_path() -> None:
@@ -353,35 +410,59 @@ class WhisperTranscriber:
     ) -> Path:
         """确保 MLX 权重在本地就位，返回模型目录。
 
-        只有两级来源：本地已就位就直接用（零请求），否则下载本仓库 Release 的
-        成品包。**不再自动退回 HF 转换**——转换要额外依赖一次 1.5G 下载和一整套
-        重写逻辑，出错时也无从校验；下载失败就给出可操作的手动放置路径，
-        让用户自己决定要不要绕这一下。
+        本地已就位就直接用（零请求），否则按档位取成品：
+        - belle：本仓库 Release 的自打包 zip（社区那份 mlx-whisper 不认，我们打好的）
+        - openai 系：mlx-community 直接拉（那边本来就是 mlx-whisper 认的成品格式，
+          **零转换**——不是之前删掉的那套"下载 + 重写 config"）
         """
         if not self.mlx_root:
             raise RuntimeError("未配置 MLX 模型目录，无法使用 M 系加速")
         directory = self.mlx_root / MLX_MODEL_DIRS[model_name]
-        if all((directory / name).is_file() for name in MLX_MODEL_FILES):
+        if mlx_model_ready(directory):
             return directory
 
         release_url = MLX_RELEASE_URLS.get(model_name)
-        if not release_url:
-            raise RuntimeError(f"「{model_name}」没有配置 M 系加速权重的下载地址。")
         try:
-            self._download_mlx_release(release_url, directory, cancel_event)
+            if release_url:
+                self._download_mlx_release(release_url, directory, cancel_event)
+            else:
+                self._download_mlx_from_hf(model_name, directory, cancel_event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            source = release_url or MLX_HF_REPOS.get(model_name, "")
             raise RuntimeError(
                 f"MLX 模型 {model_name} 下载失败：{exc}\n"
-                f"可以手动下载 {release_url}，把解压出的目录放到 {directory}"
+                f"可以手动下载 {source} 放到 {directory}"
             ) from exc
-        if not all((directory / name).is_file() for name in MLX_MODEL_FILES):
+        if not mlx_model_ready(directory):
             raise RuntimeError(
-                f"MLX 模型 {model_name} 下载完成但文件不齐"
-                f"（需要 {'、'.join(MLX_MODEL_FILES)}），请重新下载或手动放置到 {directory}"
+                "MLX 模型 "
+                f"{model_name} 下载完成但文件不齐（需要 config.json + weights 任一格式），"
+                f"请重新下载或手动放置到 {directory}"
             )
         return directory
+
+    def _download_mlx_from_hf(
+        self, model_name: str, directory: Path, cancel_event: threading.Event | None
+    ) -> None:
+        """从 mlx-community 直接拉成品权重（openai 系，无需任何转换）。"""
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise RuntimeError(
+                "下载 MLX 模型需要 huggingface-hub（随 mlx-whisper 安装）"
+            ) from exc
+
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        directory.mkdir(parents=True, exist_ok=True)
+        # 注意 snapshot_download 没有 cancel_event 参数（那是别的下载入口的），
+        # 传了会 TypeError；这里的下载是一次性的，取消交给进程退出处理。
+        snapshot_download(
+            repo_id=MLX_HF_REPOS[model_name],
+            local_dir=str(directory),
+        )
 
     def _download_mlx_release(
         self, url: str, directory: Path, cancel_event: threading.Event | None
@@ -434,12 +515,25 @@ class WhisperTranscriber:
         started = time.monotonic()
         # mlx-whisper 没有逐段回调，转写期间既给不了心跳，也**不能中途取消**
         # ——这是它的能力边界，如实写进 fallback_note，不假装能取消。
+        #
+        # 幻觉抑制（与 faster-whisper 路径的 vad/repetition 手段对齐，用 mlx 支持的
+        # 等价参数，A/B 实测见下面这组数字）：
+        #   未加抑制：0-400s 转出 1036 段、几乎全是 "! ! !"，正文被淹没
+        #   加抑制后：225 段、正文完整，initial_prompt（视频标题）也不再被复读
         result = mlx_whisper.transcribe(
             str(media_path),
             path_or_hf_repo=str(model_dir),
             initial_prompt=initial_prompt,
-            temperature=0.0,
             verbose=False,
+            # 断开上下文传递：片头静音产出的幻觉会顺着 previous text 一路复读下去
+            condition_on_previous_text=False,
+            # 0.6 = openai/whisper 官方默认。0.9 会把开头 30 秒也判成静音跳掉——
+            # 串行实测 mlx/base 与 mlx/large-v3 都因此丢了第一句
+            no_speech_threshold=0.6,
+            hallucination_silence_threshold=2.0,
+            # 重复文本更容易触发压缩比超标；超标后按温度序列重解
+            compression_ratio_threshold=2.0,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         )
         if cancel_event is not None and cancel_event.is_set():
             raise TranscriptionCancelledError()
@@ -450,6 +544,7 @@ class WhisperTranscriber:
             )
             for item in (result.get("segments") or [])
             if str(item.get("text") or "").strip()
+            and not looks_like_hallucination(str(item.get("text") or ""))
         ]
         duration = float(result.get("duration") or 0)
         if progress_callback is not None and duration:
@@ -755,7 +850,7 @@ class WhisperTranscriber:
         if not mlx_supported(model_name) or not self.mlx_root:
             return "unsupported"
         directory = self.mlx_root / MLX_MODEL_DIRS[model_name]
-        if all((directory / name).is_file() for name in MLX_MODEL_FILES):
+        if mlx_model_ready(directory):
             return "cached"
         if directory.is_dir() and any(directory.iterdir()):
             return "incomplete"

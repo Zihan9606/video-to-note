@@ -846,6 +846,13 @@ def test_mlx_transcribe_passes_hallucination_guards(
             }
 
     monkeypatch.setitem(sys.modules, "mlx_whisper", FakeMlx)
+    # 分段路径要解码真实音频并跑 VAD：这里 mock 成"1 秒、单段"，
+    # 让测试聚焦在参数传递与幻觉过滤上（真实音频的验证走端到端）
+    monkeypatch.setattr(
+        whisper_asr, "_load_audio_mono_16k",
+        lambda _p: __import__("numpy").zeros(16000, dtype="float32"),
+    )
+    monkeypatch.setattr(whisper_asr, "_speech_segments", lambda _a: [(0, 16000)])
     model_dir = tmp_path / "mlx" / whisper_asr.MLX_MODEL_DIRS["belle-turbo-zh"]
     model_dir.mkdir(parents=True)
     for name in whisper_asr.MLX_MODEL_FILES:

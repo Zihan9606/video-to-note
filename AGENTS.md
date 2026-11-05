@@ -111,6 +111,12 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
   权重文件名有两种合法格式（`mlx_model_ready` 同时认）：自打包的 belle 是
   `weights.safetensors`，mlx-community 的 openai 系是 `weights.npz`——
   mlx_whisper 的加载器两种都读，校验只认前者会把下好的 npz 误判成"文件不齐"。
+  **转写走项目层 VAD 分段**（`_speech_segments` 用 faster-whisper 自带的 silero，
+  参数对齐 CPU 路径）：mlx-whisper 没有 `vad_filter`，0-30s 整窗一旦解码失败，
+  whisper 会按输出的 timestamp 把 seek 推到后面、开头内容被永久越过——实测四组
+  参数（含官方默认）都识别不出第一句 "so anyway…"，而同一段音频 CPU 可以，
+  差别正是 CPU 开了 VAD。分段转写还顺带解决"MLX 转写期间无进度、不能取消"：
+  段与段之间可以报进度、检查取消。**改这块时别把分段退回整段转**。
   另外 `mlx_whisper` 解码音频要 ffmpeg 二进制（faster-whisper 走 PyAV 所以原本不需要），
   `_ensure_ffmpeg_on_path` 会给 imageio-ffmpeg 的静态版在临时目录建 `ffmpeg` 符号链接
   （它的原文件名带平台后缀，光加 PATH 找不到）。

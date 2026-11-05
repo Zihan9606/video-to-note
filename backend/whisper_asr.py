@@ -152,6 +152,83 @@ def looks_like_hallucination(text: str) -> bool:
     return False
 
 
+VAD_SAMPLE_RATE = 16000
+
+
+def _load_audio_mono_16k(path: Path) -> Any:
+    """解码成 silero VAD 要的格式：16k 单声道 float32（av 是项目既有依赖）。"""
+    import av
+    import numpy as np
+
+    container = av.open(str(path))
+    try:
+        stream = container.streams.audio[0]
+        stream.thread_type = "AUTO"
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=VAD_SAMPLE_RATE)
+        chunks = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                chunks.append(resampled.to_ndarray().reshape(-1))
+    finally:
+        container.close()
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32)
+
+
+def _speech_segments(audio: Any) -> list[tuple[int, int]]:
+    """silero VAD 切段，返回 (起始样本, 结束样本) 列表。
+
+    参数对齐 CPU 路径（faster-whisper 的 vad_filter：min_silence 500ms、
+    pad 400ms）；相邻段间隔 < 0.3s 就并起来——VAD 常把一句话切成两半，
+    段太碎会让 whisper 丢上下文。
+    """
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    stamps = get_speech_timestamps(
+        audio,
+        vad_options=VadOptions(
+            min_silence_duration_ms=500,
+            speech_pad_ms=400,
+            min_speech_duration_ms=200,
+        ),
+        sampling_rate=VAD_SAMPLE_RATE,
+    )
+    merged: list[tuple[int, int]] = []
+    for seg in stamps:
+        start, end = int(seg["start"]), int(seg["end"])
+        if merged and start - merged[-1][1] < int(0.3 * VAD_SAMPLE_RATE):
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _mlx_transcribe_clip(
+    model_dir: Path, media_path: Path, clip: str | None, initial_prompt: str | None
+) -> dict:
+    """单次 mlx-whisper 调用（幻觉抑制参数集中在这里）。"""
+    import mlx_whisper
+
+    kwargs: dict[str, Any] = {}
+    if clip:
+        kwargs["clip_timestamps"] = clip
+    return mlx_whisper.transcribe(
+        str(media_path),
+        path_or_hf_repo=str(model_dir),
+        initial_prompt=initial_prompt,
+        verbose=False,
+        # 断开上下文传递：静音/音乐产出的幻觉会顺着 previous text 一路复读下去
+        condition_on_previous_text=False,
+        # 0.6 = openai/whisper 官方默认（0.9 会把开头 30 秒判成静音跳掉）
+        no_speech_threshold=0.6,
+        hallucination_silence_threshold=2.0,
+        compression_ratio_threshold=2.0,
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        **kwargs,
+    )
+
+
 def _ensure_ffmpeg_on_path() -> None:
     """mlx_whisper 解码音频要调 ffmpeg 二进制（faster-whisper 走 PyAV，不需要）。
 
@@ -510,55 +587,56 @@ class WhisperTranscriber:
             raise TranscriptionCancelledError()
 
         started = time.monotonic()
-        # mlx-whisper 没有逐段回调，转写期间既给不了心跳，也**不能中途取消**
-        # ——这是它的能力边界，如实写进 fallback_note，不假装能取消。
-        #
-        # 幻觉抑制（与 faster-whisper 路径的 vad/repetition 手段对齐，用 mlx 支持的
-        # 等价参数，A/B 实测见下面这组数字）：
-        #   未加抑制：0-400s 转出 1036 段、几乎全是 "! ! !"，正文被淹没
-        #   加抑制后：225 段、正文完整，initial_prompt（视频标题）也不再被复读
-        result = mlx_whisper.transcribe(
-            str(media_path),
-            path_or_hf_repo=str(model_dir),
-            initial_prompt=initial_prompt,
-            verbose=False,
-            # 断开上下文传递：片头静音产出的幻觉会顺着 previous text 一路复读下去
-            condition_on_previous_text=False,
-            # 0.6 = openai/whisper 官方默认。0.9 会把开头 30 秒也判成静音跳掉——
-            # 串行实测 mlx/base 与 mlx/large-v3 都因此丢了第一句
-            no_speech_threshold=0.6,
-            hallucination_silence_threshold=2.0,
-            # 重复文本更容易触发压缩比超标；超标后按温度序列重解
-            compression_ratio_threshold=2.0,
-            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-        )
+        # 项目层补 VAD：mlx-whisper 没有 vad_filter，0-30s 整窗一旦解码失败，
+        # whisper 会按输出的 timestamp 把 seek 推到后面，开头内容被永久越过——
+        # 实测四组参数（含官方默认）都识别不出第一句 "so anyway, the course…"，
+        # 而同一段音频的 CPU belle 可以，差别正是 CPU 路径开了 VAD。
+        # 这里用 faster-whisper 自带的 silero 切出语音段、逐段 clip 转写，
+        # 再把段内时间戳加上偏移拼回去；顺带把"转写期间无进度、不能取消"
+        # 也解决了——段与段之间可以报进度、检查取消。
+        audio = _load_audio_mono_16k(media_path)
+        duration = len(audio) / VAD_SAMPLE_RATE
+        speech = _speech_segments(audio) or [(0, len(audio))]
+
+        segments: list[TranscriptSegment] = []
+        language: str | None = None
+        for seg_start, seg_end in speech:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TranscriptionCancelledError()
+            offset = seg_start / VAD_SAMPLE_RATE
+            clip = f"{offset:.3f},{seg_end / VAD_SAMPLE_RATE:.3f}"
+            result = _mlx_transcribe_clip(model_dir, media_path, clip, initial_prompt)
+            for item in result.get("segments") or []:
+                text = str(item.get("text") or "").strip()
+                if not text or looks_like_hallucination(text):
+                    continue
+                segments.append(
+                    TranscriptSegment(
+                        float(item["start"]) + offset,
+                        float(item["end"]) + offset,
+                        text,
+                    )
+                )
+            if language is None and result.get("language"):
+                language = str(result["language"])
+            if progress_callback is not None:
+                progress_callback(seg_end / VAD_SAMPLE_RATE, duration)
+
         if cancel_event is not None and cancel_event.is_set():
             raise TranscriptionCancelledError()
-
-        segments = [
-            TranscriptSegment(
-                float(item["start"]), float(item["end"]), str(item.get("text") or "").strip()
-            )
-            for item in (result.get("segments") or [])
-            if str(item.get("text") or "").strip()
-            and not looks_like_hallucination(str(item.get("text") or ""))
-        ]
-        duration = float(result.get("duration") or 0)
-        if progress_callback is not None and duration:
-            progress_callback(duration, duration)
         return {
             "text": " ".join(item.text for item in segments),
             "segments": segments,
-            "language": result.get("language") or "unknown",
-            "language_probability": float(result.get("language_probability") or 0.0),
+            "language": language or "unknown",
+            "language_probability": 1.0,
             "device": "metal",
             "model": model_name,
             "requested_model": model_name,
             "duration": duration,
             "duration_after_vad": duration,
             "fallback_note": (
-                "M 系加速（Metal）：转写期间不显示逐段进度，也不能中途打断"
-                "（mlx-whisper 的能力边界）；取消会在这一段转写结束后立即生效。"
+                "M 系加速（Metal）：按语音段分段转写（VAD），进度按段推进，"
+                "取消在段与段之间生效。"
             ),
             "model_load_seconds": 0.0,
             "transcribe_seconds": round(time.monotonic() - started, 1),

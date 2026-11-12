@@ -7,9 +7,9 @@
 
 <p align="center">🌐 <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a></p>
 
-<p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="最新版本"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
+<p align="center"><span style="white-space: nowrap;"><a href="https://github.com/Zihan9606/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/Zihan9606/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="最新版本"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/Zihan9606/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
 
-<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ 下载 Windows 便携版 / macOS 版</strong></a></p>
+<p align="center"><a href="https://github.com/Zihan9606/video-to-note/releases/latest"><strong>⬇️ 下载 Windows 便携版 / macOS 版</strong></a></p>
 
 <p align="center">🎬 宣传视频：<a href="https://www.bilibili.com/video/BV1Qwby6DEu1/">https://www.bilibili.com/video/BV1Qwby6DEu1/</a> &nbsp;·&nbsp; 👥 QQ 交流群：<code>739200648</code></p>
 
@@ -62,7 +62,7 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 
 ## 🚀 便携版下载（推荐）
 
-普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.2-portable.exe`（Windows）或 `VideoToNo-1.4.2-macos.zip`（Apple Silicon Mac）：
+普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/Zihan9606/video-to-note/releases/latest) 中的 `VideoToNo-1.4.2-portable.exe`（Windows）或 `VideoToNo-1.4.2-macos.zip`（Apple Silicon Mac）：
 
 1. Windows：下载并双击 exe；macOS：解压后双击 `VideoToNo.app`——从网上下载的包首次打开会被 Gatekeeper 拦下，在「系统设置 → 隐私与安全性」里点「仍要打开」，或在终端执行 `xattr -dr com.apple.quarantine VideoToNo.app`；
 2. 等待浏览器自动打开本地页面；
@@ -80,6 +80,7 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 - 🧠 **长内容整理**：短转录直接生成，长转录自动分块、归并并控制上下文压力；生成后会核对是否写到材料结尾，小缺口自动补写。
 - 🖼️ **多格式输出**：Markdown 笔记、HTML、JSON、纯文本和 PNG 图片；可选提取视频截图作为附件。
 - 🤖 **给 agent 留了原料出口**：接入的 agent 只要「带时间轴转录」，可以不走大模型、不需要给本机配 API Key，笔记风格由 agent 自己定。
+- ⚠️ **M 系芯片加速的质量提示**：核显（MLX）路径的转录质量可能低于 CPU int8——**可能出现乱码、重复、丢失片段等问题**。对准确度要求高的任务建议不勾选加速（走 CPU）。
 - ⚡ **M 系芯片加速（Apple Silicon）**：勾选「启用 GPU 加速」后走 Apple 官方 MLX 用核显转写，**当前仅支持 `belle-turbo-zh`**——加速开着时模型下拉只留它，其余置灰并说明原因。这一档是实测真受益的：同一段音频核显 14.8 秒、CPU 94.3 秒（**快 6.4 倍**）。openai 系（base/small/medium 等）实测核显**反而比 CPU int8 慢**（如 base 10.3 秒 vs 5.2 秒）且会丢开头，所以不开。不勾选加速时一律走 **CPU int8**（任何模型都是）。
 - 📋 **按 UID 批量取址**：输入 UP 主 UID 取投稿地址——**只有「全部视频」和「最近 N 个」两个选项，两者共用同一套增量存储**：地址存本机 `workspace/up_lists/<uid>.json`，首次拉全后，之后每次只补新增（撞到已知视频即停），所以不会反复撞 B 站限流。
 - 🕷️ **浏览器抓取（拿全量更稳，且带增量）**：粘贴空间链接（如 `space.bilibili.com/123456/upload/video`），用 Playwright 打开真实 Chromium 加载页面、**逐页点分页器**并拦截页面自己的接口响应——字段最全（标题 + 精确投稿时间），实测 185 条一次抓全。**同样走增量**：本地已完整时只看第 1 页（有无新视频），缺过哪几页就只补哪几页；被拦的页会记进缓存，下次直奔它去，不必再从头翻 5 页。**合集也行**：贴 `space.bilibili.com/<UID>/lists/<合集号>?type=season` 就抓那个合集（实测 97/97，30 秒），结果单独存 `up_lists/<UID>_season_<合集号>.json`，和投稿列表互不干扰。
@@ -126,7 +127,7 @@ faster-whisper 本地转写
 源码用户直接 `git clone` 或在 GitHub 选择 **Code → Download ZIP** 即可获取完整项目。**Windows 与 macOS 共用同一个仓库、同一条命令**：
 
 ```bash
-git clone https://github.com/like-attract/video-to-note.git
+git clone git@github.com:Zihan9606/video-to-note.git
 cd video-to-note
 python3 scripts/bootstrap.py     # Windows 用 python：建 .venv、装依赖、修证书
 python3 scripts/manage.py start  # 启动（占用 8000 时加 --port 8011）

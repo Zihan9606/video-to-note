@@ -871,3 +871,29 @@ def test_mlx_transcribe_passes_hallucination_guards(
     texts = [segment.text for segment in result["segments"]]
     assert texts == ["正常的一句话"], f"幻觉段必须被滤掉，实际={texts}"
     assert result["device"] == "metal"
+
+
+def test_segment_is_junk_filters_backwards_and_foreign_scripts() -> None:
+    """L1 段级过滤：倒乱/零长、非预期脚本都要拦，正常中英文要放行。
+
+    素材取自真实任务输出（最新 P1）：289/1344 段是倒乱，`액`/`И`/`원`
+    是幻觉里出现的韩/西里尔/谚文。
+    """
+    from backend.whisper_asr import _has_unexpected_script, segment_is_junk
+
+    # 时间戳无效（倒乱 / 零长）
+    assert segment_is_junk(61.178, 51.118, "available"), "end < start 必须丢"
+    assert segment_is_junk(6482.2, 6482.2, "breaker"), "零长段必须丢"
+    assert segment_is_junk(1859.9, 1859.95, "kg."), "小于 0.05 秒必须丢"
+    # 正常内容放行
+    assert not segment_is_junk(2.98, 9.98, "So anyway, the course I'm going to teach is called financial theory.")
+    assert not segment_is_junk(1788.8, 1793.8, "theory of collateral and margins does explain these things.")
+
+    # 非预期脚本（幻觉混入）
+    assert _has_unexpected_script("액.smaker.org"), "谚文必须拦"
+    assert _has_unexpected_script("childcareИ encouraged opportunity원"), "西里尔/谚文必须拦"
+    assert _has_unexpected_script("وف إنналéma"), "阿拉伯文必须拦"
+    # 正常语言放行
+    assert not _has_unexpected_script("financial theory and margins")
+    assert not _has_unexpected_script("市盈率处于历史中位数附近")
+    assert not _has_unexpected_script("10:30 - 12:00, S&P 500?")

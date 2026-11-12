@@ -2626,3 +2626,76 @@ def test_upload_names_task_folder_after_filename(
     task_id = response.json()["task_id"]
     assert task_id == f"高等数学_第3讲_{today}"
     assert (tmp_path / task_id).is_dir()
+
+
+def _make_wav(path: Path, seconds: float, rate: int = 16000) -> Path:
+    """造一段 440Hz 正弦波 wav（截断测试用，无需真实素材）。"""
+    import math
+    import struct
+    import wave
+
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(
+            b"".join(
+                struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / rate)))
+                for i in range(int(rate * seconds))
+            )
+        )
+    return path
+
+
+def test_audio_trim_writes_two_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """截断：前 x 分钟与 x 分钟之后各出一个 16k mono wav，可直接喂转录。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    source = _make_wav(tmp_path / "sample.wav", 30)
+
+    data = TestClient(main.app).post(
+        "/api/audio-trim", json={"source_path": str(source), "minutes": 0.1}
+    ).json()
+
+    assert data["cut_minutes"] == 0.1
+    assert abs(data["source_duration"] - 30) < 1.5, data
+    assert 4.5 <= data["first"]["duration"] <= 7.5, f"前段应约 6 秒：{data['first']}"
+    assert 22.0 <= data["rest"]["duration"] <= 25.5, f"后段应约 24 秒：{data['rest']}"
+    assert (tmp_path / "_trim" / data["first"]["name"]).is_file()
+    assert (tmp_path / "_trim" / data["rest"]["name"]).is_file()
+
+    # 打开产物目录复用 open-directory：_trim 同样受"必须在工作区内"的约束
+    opened: list[Path] = []
+    monkeypatch.setattr(main, "_open_in_file_manager", lambda path: opened.append(path) or True)
+    resp = TestClient(main.app).post("/api/open-directory", json={"task_id": "_trim"}).json()
+    assert resp["opened"] is True and resp["path"].endswith("_trim")
+    assert opened[0].name == "_trim"
+
+
+def test_audio_trim_rejects_bad_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文件不存在/扩展名不对/截断点越界/空路径，都要给可操作的拒绝理由。"""
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    source = _make_wav(tmp_path / "sample.wav", 30)
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    client = TestClient(main.app)
+
+    missing = client.post(
+        "/api/audio-trim", json={"source_path": str(tmp_path / "nope.wav"), "minutes": 1}
+    )
+    assert missing.status_code == 404 and "文件不存在" in missing.json()["detail"]
+
+    bad = client.post(
+        "/api/audio-trim", json={"source_path": str(tmp_path / "notes.txt"), "minutes": 1}
+    )
+    assert bad.status_code == 400 and "不支持的文件类型" in bad.json()["detail"]
+
+    over = client.post(
+        "/api/audio-trim", json={"source_path": str(source), "minutes": 999}
+    )
+    assert over.status_code == 400 and "超过音频总长" in over.json()["detail"]
+
+    empty = client.post("/api/audio-trim", json={"source_path": "  ", "minutes": 1})
+    assert empty.status_code == 400 and "完整路径" in empty.json()["detail"]

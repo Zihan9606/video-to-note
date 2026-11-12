@@ -153,6 +153,12 @@ def looks_like_hallucination(text: str) -> bool:
 
 
 VAD_SAMPLE_RATE = 16000
+# VAD 段上限（秒）。两个实测结论共同决定取 20：
+# - 必须限住：不限就切出 159 秒巨型段，clip_timestamps 失效、seek 跳过开头
+# - 不能取 30：完整音频上 30 秒段的首窗解码失败（输出多语言垃圾），
+#   还触发 6 次温度回退重解（113.9s vs 20 秒段的 15.8s）；20/15/10 秒均稳定 HIT，
+#   20 在"段数不过碎"与"转写快"之间平衡
+MAX_SEGMENT_SECONDS = 20
 
 
 def _load_audio_mono_16k(path: Path) -> Any:
@@ -177,11 +183,14 @@ def _load_audio_mono_16k(path: Path) -> Any:
 
 
 def _speech_segments(audio: Any) -> list[tuple[int, int]]:
-    """silero VAD 切段，返回 (起始样本, 结束样本) 列表。
+    """silero VAD 切段，返回 (起始样本, 结束样本) 列表，段长不超过 MAX_SEGMENT_SECONDS。
 
-    参数对齐 CPU 路径（faster-whisper 的 vad_filter：min_silence 500ms、
-    pad 400ms）；相邻段间隔 < 0.3s 就并起来——VAD 常把一句话切成两半，
-    段太碎会让 whisper 丢上下文。
+    三件事缺一不可（每一件都对应一次实测翻车）：
+    - `max_speech_duration_s`：让 VAD 先控段长（不传就直接吐出 160 秒巨型段）
+    - 合并只在"拼完不超上限"时做：0.3s 的近距合并本意是防一句话被切两半，
+      但讲座连续说话、间隔只有 0.2s，一路拼下去会把整篇接成一段
+    - 超限硬切兜底：即使上游行为变化，clip_timestamps 也不会失效
+    参数对齐 CPU 路径（faster-whisper 的 vad_filter：min_silence 500ms、pad 400ms）。
     """
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
@@ -191,32 +200,55 @@ def _speech_segments(audio: Any) -> list[tuple[int, int]]:
             min_silence_duration_ms=500,
             speech_pad_ms=400,
             min_speech_duration_ms=200,
+            max_speech_duration_s=MAX_SEGMENT_SECONDS,
         ),
         sampling_rate=VAD_SAMPLE_RATE,
     )
+    max_samples = int((MAX_SEGMENT_SECONDS + 1) * VAD_SAMPLE_RATE)
     merged: list[tuple[int, int]] = []
     for seg in stamps:
         start, end = int(seg["start"]), int(seg["end"])
-        if merged and start - merged[-1][1] < int(0.3 * VAD_SAMPLE_RATE):
+        if (
+            merged
+            and start - merged[-1][1] < int(0.3 * VAD_SAMPLE_RATE)
+            and end - merged[-1][0] <= max_samples
+        ):
             merged[-1] = (merged[-1][0], end)
         else:
             merged.append((start, end))
-    return merged
+
+    segments: list[tuple[int, int]] = []
+    for start, end in merged:
+        while end - start > max_samples:
+            cut = start + int(MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE)
+            segments.append((start, cut))
+            start = cut
+        segments.append((start, end))
+    return segments
 
 
 def _mlx_transcribe_clip(
-    model_dir: Path, media_path: Path, clip: str | None, initial_prompt: str | None
+    model_dir: Path, audio: Any, clip: str | None
 ) -> dict:
-    """单次 mlx-whisper 调用（幻觉抑制参数集中在这里）。"""
+    """单次 mlx-whisper 调用（幻觉抑制参数集中在这里）。
+
+    **收音频数组、不收文件路径**：mlx_whisper.transcribe 传文件路径时内部会
+    每次调 load_audio 重新解码整个文件——VAD 已经解码过一遍，231 段就是把
+    71 分钟的音频解码 231 次（这才是转录慢的大头）。传数组一次解码全程复用。
+
+    **不传 initial_prompt**（任务标题）：实测同一段音频，带标题 prompt 的
+    4 次全部丢失第一句、还诱发 `strengthen strengthen…` 这种复读；去掉后
+    稳定命中。belle 是中文微调模型，中文标题进英文解码上下文是纯干扰——
+    CPU 路径（CT2）不受此影响，仍照常传 prompt。
+    """
     import mlx_whisper
 
     kwargs: dict[str, Any] = {}
     if clip:
         kwargs["clip_timestamps"] = clip
     return mlx_whisper.transcribe(
-        str(media_path),
+        audio,
         path_or_hf_repo=str(model_dir),
-        initial_prompt=initial_prompt,
         verbose=False,
         # 断开上下文传递：静音/音乐产出的幻觉会顺着 previous text 一路复读下去
         condition_on_previous_text=False,
@@ -227,6 +259,50 @@ def _mlx_transcribe_clip(
         temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         **kwargs,
     )
+
+
+# 段级过滤：倒乱/零长的时间戳、非预期脚本（幻觉混入的韩/西里尔/阿拉伯…）。
+# 参考 stable-ts 的 max_instant_words（瞬时词超限删段）与工程上通用的脚本过滤：
+# 真实的英/中内容里不会平白出现谚文或西里尔字母，出现即判幻觉。
+MIN_SEGMENT_SECONDS = 0.05
+
+_UNEXPECTED_SCRIPT_RANGES = (
+    (0xAC00, 0xD7AF),    # Hangul（谚文）
+    (0x1100, 0x11FF),    # Hangul Jamo
+    (0x0400, 0x04FF),    # Cyrillic
+    (0x0600, 0x06FF),    # Arabic
+    (0x0750, 0x077F),    # Arabic Supplement
+    (0x0590, 0x05FF),    # Hebrew
+    (0x0E00, 0x0E7F),    # Thai
+    (0x0900, 0x097F),    # Devanagari
+    (0x3040, 0x309F),    # Hiragana（中文任务里出现日文假名多半是幻觉）
+    (0x30A0, 0x30FF),    # Katakana
+)
+
+
+def _has_unexpected_script(text: str) -> bool:
+    """文本里是否混入了非预期脚本（英/中之外的书写系统）。"""
+    for char in text:
+        code = ord(char)
+        for low, high in _UNEXPECTED_SCRIPT_RANGES:
+            if low <= code <= high:
+                return True
+    return False
+
+
+def segment_is_junk(start: float, end: float, text: str) -> bool:
+    """段级过滤：时间戳无效、幻觉文本、非预期脚本 → 丢弃。
+
+    - 倒乱/零长（end <= start 或 < 0.05s）：最新 P1 实测 1344 段里有 289 段
+      （21%）是这类，模型在无上下文分段下 timestamp 崩坏的产物
+    - 幻觉文本：`looks_like_hallucination`（纯标点、窄字符复读）
+    - 非预期脚本：`액`（韩）、`И`（西里尔）、`원` 这类混入
+    """
+    if end <= start or (end - start) < MIN_SEGMENT_SECONDS:
+        return True
+    if looks_like_hallucination(text):
+        return True
+    return _has_unexpected_script(text)
 
 
 def _ensure_ffmpeg_on_path() -> None:
@@ -594,6 +670,9 @@ class WhisperTranscriber:
         # 这里用 faster-whisper 自带的 silero 切出语音段、逐段 clip 转写，
         # 再把段内时间戳加上偏移拼回去；顺带把"转写期间无进度、不能取消"
         # 也解决了——段与段之间可以报进度、检查取消。
+        # initial_prompt（任务标题）故意不往下传：MLX 路径下它会诱发首窗复读
+        # 并丢掉第一句（实测带 prompt 4/4 MISS、无 prompt HIT），
+        # 详见 _mlx_transcribe_clip 的说明。CPU 路径不受影响、照常传。
         audio = _load_audio_mono_16k(media_path)
         duration = len(audio) / VAD_SAMPLE_RATE
         speech = _speech_segments(audio) or [(0, len(audio))]
@@ -605,18 +684,21 @@ class WhisperTranscriber:
                 raise TranscriptionCancelledError()
             offset = seg_start / VAD_SAMPLE_RATE
             clip = f"{offset:.3f},{seg_end / VAD_SAMPLE_RATE:.3f}"
-            result = _mlx_transcribe_clip(model_dir, media_path, clip, initial_prompt)
+            result = _mlx_transcribe_clip(model_dir, audio, clip)
             for item in result.get("segments") or []:
                 text = str(item.get("text") or "").strip()
-                if not text or looks_like_hallucination(text):
+                if not text:
                     continue
-                segments.append(
-                    TranscriptSegment(
-                        float(item["start"]) + offset,
-                        float(item["end"]) + offset,
-                        text,
-                    )
-                )
+                # clip_timestamps 的输出就是**绝对时间**（whisper 源码里
+                # time_offset = seek × hop 已经加进 start 了），不能再叠加 offset：
+                # 实测 clip="31.89,54.42" 输出 start=31.890；之前再加 31.89，
+                # 每段偏移一次、最终时间轴膨胀到真实长度的 1.99 倍（71 分钟转出 2 小时）
+                start = float(item["start"])
+                end = float(item["end"])
+                # 段级过滤：倒乱/零长、幻觉文本、非预期脚本一律丢弃
+                if segment_is_junk(start, end, text):
+                    continue
+                segments.append(TranscriptSegment(start, end, text))
             if language is None and result.get("language"):
                 language = str(result["language"])
             if progress_callback is not None:

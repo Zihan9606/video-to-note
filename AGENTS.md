@@ -117,6 +117,13 @@ curl -s ... -d '{"uid":672328094,"mode":"all","max_pages":1,"start_page":<next_p
   参数（含官方默认）都识别不出第一句 "so anyway…"，而同一段音频 CPU 可以，
   差别正是 CPU 开了 VAD。分段转写还顺带解决"MLX 转写期间无进度、不能取消"：
   段与段之间可以报进度、检查取消。**改这块时别把分段退回整段转**。
+  这块有两个实测踩过的坑，改动前先读注释：① **段长必须限住**
+  （`MAX_SEGMENT_SECONDS=30`）——VAD 要传 `max_speech_duration_s`，近距合并
+  只在"拼完不超限时"才做，否则讲座连续说话会被拼成 159 秒巨型段，
+  `clip_timestamps` 随之失效、首窗失败就跳过开头；② **不给 MLX 传
+  `initial_prompt`**（任务标题）——中文标题进英文解码上下文会诱发首窗复读
+  并丢第一句（实测带 prompt 4/4 MISS、无 prompt HIT），CPU 路径不受影响
+  仍照常传。
   另外 `mlx_whisper` 解码音频要 ffmpeg 二进制（faster-whisper 走 PyAV 所以原本不需要），
   `_ensure_ffmpeg_on_path` 会给 imageio-ffmpeg 的静态版在临时目录建 `ffmpeg` 符号链接
   （它的原文件名带平台后缀，光加 PATH 找不到）。

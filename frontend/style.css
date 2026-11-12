@@ -718,3 +718,92 @@ input[type="checkbox"] {
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+
+/* ---- 工具 tab：音/视频转录 | 音频截断 ---- */
+.tool-tabs {
+    display: flex;
+    gap: 6px;
+    margin-top: 14px;
+}
+
+.tool-tab {
+    flex: 1;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-soft);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.tool-tab:hover { background: var(--hover); }
+
+.tool-tab.active {
+    color: var(--green);
+    background: var(--green-soft);
+    border-color: var(--green);
+}
+
+/* ---- 音频截断面板 ---- */
+.trim-title h2 { margin: 4px 0 0; font-size: 18px; }
+
+.trim-sub {
+    display: block;
+    max-width: 720px;
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.6;
+}
+
+.trim-controls {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.trim-controls .field {
+    flex: 1 1 320px;
+    margin-top: 0;
+}
+
+.trim-controls .trim-minutes-field { flex: 0 0 150px; }
+
+.trim-actions { display: flex; gap: 8px; }
+
+#trimStatus { margin-top: 10px; }
+
+.trim-result {
+    margin-top: 12px;
+    padding: 10px 14px;
+    font-size: 13px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.trim-result-row {
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    flex-wrap: wrap;
+    align-items: baseline;
+}
+
+.trim-result-row > span {
+    min-width: 96px;
+    color: var(--text-muted);
+}
+
+.trim-result-row code {
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.trim-result-row + .trim-result-row { border-top: 1px dashed var(--border); }

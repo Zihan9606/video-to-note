@@ -28,6 +28,13 @@
             </div>
         </div>
 
+        <div class="tool-tabs" role="tablist" aria-label="功能切换">
+            <button id="tabTranscribe" class="tool-tab active" type="button" role="tab"
+                    aria-selected="true" aria-controls="transcribePanel">音/视频转录</button>
+            <button id="tabTrim" class="tool-tab" type="button" role="tab"
+                    aria-selected="false" aria-controls="trimPanel">音频截断</button>
+        </div>
+
         <button id="mcpStatusChip" class="mcp-chip" type="button" hidden title="查看接入地址">
             <span class="mcp-chip-dot" aria-hidden="true"></span>
             <span>本机服务在跑 · 可让 AI 客户端直接用</span>
@@ -116,6 +123,7 @@
                     <option value="turbo">turbo（不推荐 · 中文有退化，只适合多语言提速）</option>
                     <option value="belle-turbo-zh">belle-turbo-zh（中文推荐 · 精度最好）</option>
                     <option value="paraformer-zh">paraformer-zh（中文推荐 · 最快最准，只支持中文）</option>
+                    <option value="sensevoice">sensevoice（FunASR · 中英日韩粤 · 内置标点 · 首次需下载 PyTorch 2GB+）</option>
                 </select>
             </label>
             <div class="manual-model-row">
@@ -184,7 +192,7 @@
         </div>
     </aside>
 
-    <main class="workspace">
+    <main class="workspace" id="transcribePanel">
         <header class="workspace-header">
             <div>
                 <p class="eyebrow">LOCAL WORKSPACE</p>
@@ -446,9 +454,40 @@
             <article id="markdownContent" class="markdown-body"></article>
         </section>
     </main>
+
+    <section id="trimPanel" class="workspace trim-panel" hidden
+             role="tabpanel" aria-labelledby="tabTrim">
+        <div class="section-heading">
+            <div class="trim-title">
+                <span class="section-kicker">测试素材</span>
+                <h2>音频截断</h2>
+            </div>
+            <small class="trim-sub">把本地音/视频切成「前 x 分钟」和「x 分钟之后」两段，输出 16k 单声道 wav，
+                可直接作为转录入口的素材来测（转录设置仍在左侧配置，两边共用）</small>
+        </div>
+
+        <div class="trim-controls">
+            <label class="field">
+                <span>本地文件路径</span>
+                <input type="text" id="trimSource" autocomplete="off"
+                       placeholder="/Users/you/Downloads/课程.m4a（Finder 右键可拷贝路径）">
+            </label>
+            <label class="field trim-minutes-field">
+                <span>截断点（分钟）</span>
+                <input type="number" id="trimMinutes" value="1" min="0.05" step="0.1">
+            </label>
+            <div class="trim-actions">
+                <button id="trimBtn" class="button secondary" type="button">开始截断</button>
+                <button id="trimOpenBtn" class="button ghost" type="button" disabled>打开产物目录</button>
+            </div>
+        </div>
+
+        <div id="trimStatus" class="bili-login-status" role="status" aria-live="polite"></div>
+        <div id="trimResult" class="trim-result" hidden></div>
+    </section>
 </div>
 
 <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-<script src="script.js?v=20261009-3"></script>
+<script src="script.js?v=20261111-1"></script>
 </body>
 </html>

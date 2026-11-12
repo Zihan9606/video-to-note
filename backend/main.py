@@ -70,10 +70,12 @@ from .video_processor import (
     merge_bilibili_pages,
     normalize_video_input,
 )
+from .funasr_asr import SenseVoiceTranscriber
 from .paraformer_asr import ParaformerTranscriber
 from .whisper_asr import (
     MLX_MODELS,
     WhisperTranscriber,
+    _ensure_ffmpeg_on_path,
     is_apple_silicon,
     mlx_supported,
 )
@@ -121,7 +123,7 @@ ALLOWED_MEDIA_SUFFIXES = {
 # large-v3 已下架：它要 128 mel、必须带 preprocessor_config.json，而下载清单
 # 一直没给它配（加载必报 expected 128 got 80）；实测核显/中文场景也轮不到它
 WHISPER_MODELS = {"tiny", "base", "small", "medium", "turbo", "belle-turbo-zh"}
-ASR_MODELS = WHISPER_MODELS | {"paraformer-zh"}
+ASR_MODELS = WHISPER_MODELS | {"paraformer-zh", "sensevoice"}
 DOUYIN_HINT = (
     "抖音链接解析失败。可以先点击“打开抖音浏览器”，在本机窗口完成登录/验证后重试；"
     "也可能是媒体地址已过期，请重新提交链接。"
@@ -277,6 +279,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 video_processor = VideoProcessor(WORKSPACE_DIR)
 transcriber = WhisperTranscriber(WHISPER_CACHE_DIR, mlx_root=MLX_MODEL_DIR)
 paraformer_transcriber = ParaformerTranscriber(WHISPER_CACHE_DIR)
+sensevoice_transcriber = SenseVoiceTranscriber(WHISPER_CACHE_DIR)
 
 
 async def run_transcription(
@@ -292,6 +295,17 @@ async def run_transcription(
     progress_callback(已转写秒数, 总秒数) 仅 whisper 路径支持（paraformer
     一次性出结果，且 RTF ≈ 0.05 本来就不需要心跳）。
     """
+    if model_name == "sensevoice":
+        # 注意第 4 个形参是 title（不是 initial_prompt）：paraformer 分支用
+        # initial_prompt=title 关键字传参，照抄时写成裸变量会 NameError
+        return await sensevoice_transcriber.transcribe(
+            media_path,
+            model_name,
+            use_gpu,
+            initial_prompt=title,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
     if model_name == "paraformer-zh":
         return await paraformer_transcriber.transcribe(
             media_path, model_name, use_gpu, initial_prompt=title, cancel_event=cancel_event
@@ -1166,6 +1180,13 @@ async def whisper_models_status() -> dict[str, Any]:
             "mlx_status": "unsupported",
         }
     )
+    models.append(
+        {
+            "id": "sensevoice",
+            "status": sensevoice_transcriber.cache_status(),
+            "mlx_status": "unsupported",
+        }
+    )
     return {
         "models": models,
         "manual_dir": str(WHISPER_CACHE_DIR / "manual"),
@@ -1447,6 +1468,111 @@ async def save_bili_credentials(payload: BiliCredentialsPayload) -> dict[str, An
 async def clear_bili_credentials() -> dict[str, bool]:
     config_store.clear_bili_credentials()
     return {"saved": False}
+
+
+TRIM_DIR_NAME = "_trim"
+TRIM_SOURCE_SUFFIXES = {
+    ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus",
+    ".mp4", ".mov", ".mkv", ".webm",
+}
+
+
+def _media_duration(path: Path) -> float | None:
+    """总时长（秒）。用 av 读——imageio-ffmpeg 只带 ffmpeg，没有 ffprobe。"""
+    import av
+
+    try:
+        with av.open(str(path)) as container:
+            if container.duration is None:
+                return None
+            return float(container.duration) / 1_000_000.0
+    except Exception:
+        return None
+
+
+class AudioTrimRequest(BaseModel):
+    """`POST /api/audio-trim`：把本地音/视频截成"前 x 分钟"与"x 分钟之后"两段。"""
+
+    source_path: str
+    minutes: float = 1.0
+
+
+@app.post("/api/audio-trim")
+async def audio_trim(request: AudioTrimRequest) -> dict[str, Any]:
+    """截断本地音频为两段，用于给转录流程做短素材测试。
+
+    输出 16k 单声道 wav——whisper 与 VAD 直接可吃，体积也小。只接受本机
+    已存在的文件（扩展名白名单），产物固定落在 `workspace/_trim/`，
+    打开目录复用 `/api/open-directory`（task_id 填 `_trim`，同样受
+    "必须在工作区内"的约束，不新开任意路径入口）。
+    """
+    raw = (request.source_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="请填写本地音频/视频的完整路径")
+    source = Path(raw).expanduser()
+    if source.suffix.lower() not in TRIM_SOURCE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"不支持的文件类型 {source.suffix or '(无扩展名)'}，"
+                f"可用：{'、'.join(sorted(TRIM_SOURCE_SUFFIXES))}"
+            ),
+        )
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在：{source}")
+
+    minutes = float(request.minutes)
+    if minutes <= 0:
+        raise HTTPException(status_code=400, detail="截断点必须是正数（分钟）")
+
+    _ensure_ffmpeg_on_path()
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="找不到 ffmpeg（imageio-ffmpeg 应随依赖安装）")
+
+    total = await asyncio.to_thread(_media_duration, source)
+    if not total:
+        raise HTTPException(status_code=500, detail="读不到音频时长，请确认文件可用")
+    if minutes * 60 >= total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"截断点 {minutes:g} 分钟超过音频总长 {total / 60:.1f} 分钟",
+        )
+
+    out_dir = WORKSPACE_DIR / TRIM_DIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    point = f"{minutes * 60:.3f}"
+    first = out_dir / f"{source.stem}_first_{minutes:g}min.wav"
+    rest = out_dir / f"{source.stem}_after_{minutes:g}min.wav"
+
+    plans = (
+        ([ffmpeg, "-y", "-v", "error", "-i", str(source), "-t", point], first),
+        ([ffmpeg, "-y", "-v", "error", "-ss", point, "-i", str(source)], rest),
+    )
+    for head, target in plans:
+        cmd = [*head, "-ar", "16000", "-ac", "1", str(target)]
+        done = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=600
+        )
+        if done.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail=f"截断失败：{(done.stderr or '')[-300:]}")
+
+    async def meta(path: Path) -> dict[str, Any]:
+        duration = await asyncio.to_thread(_media_duration, path)
+        return {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "duration": round(duration, 2) if duration else None,
+        }
+
+    return {
+        "dir": TRIM_DIR_NAME,
+        "source": str(source),
+        "source_duration": round(total, 2),
+        "cut_minutes": minutes,
+        "first": await meta(first),
+        "rest": await meta(rest),
+    }
 
 
 class OpenDirectoryRequest(BaseModel):

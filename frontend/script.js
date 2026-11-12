@@ -346,6 +346,10 @@ function bindEvents() {
     bindListener('upTranscribeBtn', 'click', transcribeSelectedUpVideos);
     bindListener('openWorkspaceBtn', 'click', () => openDirectory(null));
     bindListener('openTaskFolderBtn', 'click', () => openDirectory(currentTaskId));
+    bindListener('tabTranscribe', 'click', () => switchTool('transcribe'));
+    bindListener('tabTrim', 'click', () => switchTool('trim'));
+    bindListener('trimBtn', 'click', runTrim);
+    bindListener('trimOpenBtn', 'click', openTrimDir);
     toggleUpLimitField();
     initBiliLogin();
     bindListener('includeScreenshots', 'change', toggleScreenshotSettings);
@@ -1834,6 +1838,100 @@ async function fetchUpVideos(resume) {
     } finally {
         fetchButton.disabled = false;
         moreButton.disabled = false;
+    }
+}
+
+// ---- 工具 tab：音/视频转录 | 音频截断 ----
+// 侧边栏顶部两个页签切换主工作区；配置区（左侧下半部分）两页通用，
+// 截断出来的 wav 可直接填进转录入口当测试素材。
+function switchTool(tool) {
+    const showTranscribe = tool !== 'trim';
+    byId('transcribePanel').hidden = !showTranscribe;
+    byId('trimPanel').hidden = showTranscribe;
+    [['tabTranscribe', showTranscribe], ['tabTrim', !showTranscribe]].forEach(([id, active]) => {
+        const tab = byId(id);
+        tab.classList.toggle('active', active);
+        tab.setAttribute('aria-selected', String(active));
+    });
+}
+
+function formatDuration(seconds) {
+    if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+    const total = Number(seconds);
+    const minutes = Math.floor(total / 60);
+    const rest = Math.round(total % 60);
+    return `${minutes}′${String(rest).padStart(2, '0')}″`;
+}
+
+function appendTrimRow(box, label, file, sourceInfo) {
+    const row = document.createElement('div');
+    row.className = 'trim-result-row';
+    const name = document.createElement('span');
+    name.textContent = label;
+    const detail = document.createElement('code');
+    detail.textContent = sourceInfo
+        ? file
+        : `${file.name} · ${formatBytes(file.size)} · ${formatDuration(file.duration)}`;
+    row.append(name, detail);
+    box.append(row);
+}
+
+function renderTrimResult(data) {
+    const box = byId('trimResult');
+    box.textContent = '';
+    appendTrimRow(box, '源文件', `${data.source} · ${formatDuration(data.source_duration)}`, true);
+    appendTrimRow(box, `前 ${data.cut_minutes} 分钟`, data.first);
+    appendTrimRow(box, `${data.cut_minutes} 分钟之后`, data.rest);
+    box.hidden = false;
+}
+
+async function runTrim() {
+    const source = (byId('trimSource').value || '').trim();
+    const minutes = parseFloat(byId('trimMinutes').value);
+    const status = byId('trimStatus');
+    if (!source) {
+        status.textContent = '请填写本地文件的完整路径（Finder 右键可拷贝）';
+        return;
+    }
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+        status.textContent = '截断点要是正数（分钟）';
+        return;
+    }
+
+    const button = byId('trimBtn');
+    button.disabled = true;
+    byId('trimResult').hidden = true;
+    byId('trimOpenBtn').disabled = true;
+    status.textContent = '正在截断…（长文件会慢一点）';
+    try {
+        const response = await fetch(`${API_BASE}/audio-trim`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_path: source, minutes }),
+        });
+        const data = await readResponse(response, '截断失败');
+        renderTrimResult(data);
+        status.textContent = `完成：${data.first.name} 与 ${data.rest.name}`;
+        byId('trimOpenBtn').disabled = false;
+    } catch (error) {
+        status.textContent = error.message || '截断失败';
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function openTrimDir() {
+    const status = byId('trimStatus');
+    try {
+        const response = await fetch(`${API_BASE}/open-directory`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_id: '_trim' }),
+        });
+        const data = await readResponse(response, '打开目录失败');
+        status.textContent = data.opened ? `已打开：${data.path}` : `打不开：${data.path}`;
+    } catch (error) {
+        status.textContent = error.message || '打开目录失败';
     }
 }
 
